@@ -26,14 +26,14 @@ volatile uint64_t RECEIVER_TIMESTAMPS[4] = {0, 0, 0, 0};
 // Global array holding the known 3D positions of the receivers
 // (Receiver 0 is the reference)
 point RECEIVER_ARRAY[4] = {
-  {0.0, 0.0, 0.0},
-  {1.0, 1.0, 0.0},
-  {0.0, 1.0, 0.0},
-  {1.0, 0.6, 1.0}
+  {0.5, 0.3, 0.45},
+  {0.2, 0.47, 0.45},
+  {0.2, 0.13, 0.45},
+  {0.33, 0.33, 0.12}
 };
 
 double propagationSpeed = 0.00034; // Speed of sound in m/µs (340 m/s)
-point initialGuess = {0.5, 0.5, 0.5};
+point initialGuess = {0.3, 0.3, 0.3};
 
 const uint64_t measurementTimeout = 5;  // 5 ms timeout
 uint64_t measurementStartTime = 0;
@@ -71,10 +71,12 @@ double distance(point a, point b) {
               (b.y - a.y) * (b.y - a.y) +
               (b.z - a.z) * (b.z - a.z));
 }
-
-double constrain_double(double value, double low, double high) {
+/*
+double constrain_double(double value, double low, double high) {S
   return fmin(fmax(value, low), high);
 }
+*/
+
 
 // Solve a 3x3 linear system J * delta = -F using Gaussian elimination with partial pivoting.
 // J is a 3x3 matrix, F is a 3-element vector. The solution is written into delta.
@@ -142,11 +144,10 @@ void calculateTDOAposition3D(point RECEIVER_ARRAY[4], int32_t TDOA_ARRAY[4],
   double d12 = propagationSpeed * (static_cast<double>(TDOA_ARRAY[0] - TDOA_ARRAY[1]));
   double d13 = propagationSpeed * (static_cast<double>(TDOA_ARRAY[0] - TDOA_ARRAY[2]));
   double d14 = propagationSpeed * (static_cast<double>(TDOA_ARRAY[0] - TDOA_ARRAY[3]));
-  d12 = constrain_double(d12, -1.0, 1.0);
-  d13 = constrain_double(d13, -1.0, 1.0);
-  d14 = constrain_double(d14, -1.0, 1.0);
+  //d12 = constrain_double(d12, -1.0, 1.0);
+  //d13 = constrain_double(d13, -1.0, 1.0);
+  //d14 = constrain_double(d14, -1.0, 1.0);
 
-  // Initialize transmitter guess.
   double x = initialGuess.x;
   double y = initialGuess.y;
   double z = initialGuess.z;
@@ -168,7 +169,6 @@ void calculateTDOAposition3D(point RECEIVER_ARRAY[4], int32_t TDOA_ARRAY[4],
     }
 
     // Define the nonlinear functions:
-    // f = d1 - d2 - d12, g = d1 - d3 - d13, h = d1 - d4 - d14.
     double f = d1 - d2 - d12;
     double g = d1 - d3 - d13;
     double h = d1 - d4 - d14;
@@ -214,12 +214,12 @@ void calculateTDOAposition3D(point RECEIVER_ARRAY[4], int32_t TDOA_ARRAY[4],
   if (isnan(x) || isinf(x) || isnan(y) || isinf(y) || isnan(z) || isinf(z)) {
     Serial.println("Error: Calculation resulted in NaN or Infinity.");
   } else {
-    Serial.print("Estimated Position: ");
-    Serial.print(x, 6);
-    Serial.print(", ");
-    Serial.print(y, 6);
-    Serial.print(", ");
-    Serial.println(z, 6);
+    //Serial.print("Estimated Position: ");
+    Serial.print(x, 3);
+    Serial.print(",");
+    Serial.print(y, 3);
+    Serial.print(",");
+    Serial.println(z, 3);
   }
 }
 
@@ -257,7 +257,7 @@ void loop() {
       }
       // Call the revised TDOA calculation function.
       calculateTDOAposition3D(RECEIVER_ARRAY, TDOA_ARRAY, propagationSpeed, initialGuess);
-      
+      /*
       Serial.print("t1: ");
       Serial.println(TDOA_ARRAY[0]);
       Serial.print("t2: ");
@@ -266,6 +266,7 @@ void loop() {
       Serial.println(TDOA_ARRAY[2]);
       Serial.print("t4: ");
       Serial.println(TDOA_ARRAY[3]);
+      */
     }
     // Reset timestamps for the next measurement cycle.
     for (size_t i = 0; i < 4; i++) {
