@@ -1,10 +1,24 @@
 {
   "board": {
     "active_layer": 5,
-    "active_layer_preset": "",
+    "active_layer_preset": "All Layers",
     "auto_track_width": false,
     "hidden_netclasses": [],
-    "hidden_nets": [],
+    "hidden_nets": [
+      "GND",
+      "Net-(LM567CN1-Timing_Capacitor)",
+      "Net-(LM567CN1-Loop_Filter)",
+      "Net-(LM567CN1-Output_Filter)",
+      "+5V",
+      "Net-(MK1-+)",
+      "Net-(D1-A)",
+      "Net-(U1A--)",
+      "Signal",
+      "State",
+      "Net-(LM567CN1-Timing_Resistor)",
+      "Net-(LM567CN1-Output)",
+      "Net-(U1A-+)"
+    ],
     "high_contrast_mode": 0,
     "net_color_mode": 1,
     "opacity": {
@@ -87,16 +101,16 @@
       9
     ],
     "col_widths": [
-      10,
-      10,
-      10,
-      10,
-      10,
-      10,
-      10,
-      10,
-      10,
-      51
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0,
+      0
     ],
     "custom_group_rules": [],
     "expanded_rows": [],
