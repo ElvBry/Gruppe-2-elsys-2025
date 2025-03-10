@@ -187,6 +187,7 @@
       ],
       "track_widths": [
         0.0,
+        0.2,
         0.3,
         0.4,
         0.5,
@@ -506,7 +507,7 @@
       "gencad": "",
       "idf": "",
       "netlist": "",
-      "plot": "../../",
+      "plot": "Outputfiles/Gerber2/",
       "pos_files": "",
       "specctra_dsn": "",
       "step": "project git rev.step",
