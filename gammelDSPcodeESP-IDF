@@ -1,0 +1,260 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "driver/spi_master.h"
+#include "driver/ledc.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+#include "dsps_dotprod.h"
+#include "esp_timer.h"
+
+
+#define PIN_NUM_MISO 19
+#define PIN_NUM_MOSI 23
+#define PIN_NUM_CLK  18
+#define PIN_NUM_CS   13
+#define PIN_NUM_CNVST 4 // conversion trigger 
+
+#define BUFFER_SIZE 1024 // buffer can not exceed 4092
+#define REDUCED_BUFFER_SIZE 256
+
+#define PI 3.14159265358979323846
+#define SAMPLE_FREQUENCY 625000
+#define TARGET_FREQUENCY 40000
+
+#define REF_TABLE_SIZE 16
+
+static const char *TAG = "TDOA_DSP";
+
+
+int16_t ref_sine_table_Q15[REF_TABLE_SIZE] __attribute__((aligned(16))); // global lookuptable for target frequency sine. Format: Q15
+int16_t ref_cos_table_Q15[REF_TABLE_SIZE] __attribute__((aligned(16))); 
+
+void initialize_sine_table_Q15(void) {
+    double angleStep = 2*PI*TARGET_FREQUENCY/SAMPLE_FREQUENCY;
+    for (int i = 0; i < REF_TABLE_SIZE; i++) {
+        double value = sin(i*angleStep)/REF_TABLE_SIZE; // divide by tablesize to avoid overflow in dotproduct calculation
+        ref_sine_table_Q15[i] = (int16_t)(value * 32767.0); // converting to Q15 format. 32767 = 2^15 -1 
+    }
+}
+
+void initialize_cos_table_Q15(void) {
+    double angleStep = 2*PI*TARGET_FREQUENCY/SAMPLE_FREQUENCY;
+    for (int i = 0; i < REF_TABLE_SIZE; i++) {
+        double value = cos(i*angleStep)/REF_TABLE_SIZE;
+        ref_cos_table_Q15[i] = (int16_t)(value * 32767.0);
+    }
+}
+
+uint32_t calculate_signal_strength(const int16_t *cosArr, const int16_t *sineArr, const int16_t *sigArr, uint32_t len) {
+    esp_err_t ret;
+    int16_t R; // real component of signal
+    int16_t I; // imaginary component of signal
+    uint32_t result = 0; 
+    ret = dsps_dotprod_s16_ae32(cosArr, sigArr, &R, len, 0); //const int16_t *src1, const int16_t *src2, int16_t *dest, int len, int8_t shift
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to calculate dotproduct real: %s", esp_err_to_name(ret));
+        return 0;
+    }
+    ret = dsps_dotprod_s16_ae32(sineArr, sigArr, &I, len, 0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to calculate dotproduct imaginary: %s", esp_err_to_name(ret));
+        return 0;
+    }
+    result = R*R + I*I;
+    return result;
+}
+
+
+void normalize_signal_arr_Q15(int16_t *signal_arr, uint8_t len) { // normalizes array of Q15 values between -32768 32767 and divide by tablesize
+    int16_t abs_max = 0;
+    for (size_t i = 0; i < len; i++) {
+        int16_t abs_val = (signal_arr[i] < 0) ? -signal_arr[i] : signal_arr[i];
+        if (abs_val > abs_max) abs_max = abs_val;
+    }
+
+    int32_t scale_factor = ((int32_t)32767 << 15) / abs_max;
+
+    for (int i = 0; i < len; i++) {
+        int32_t temp = (int32_t)signal_arr[i] * scale_factor;
+        signal_arr[i] = (int16_t)(temp >> 15);
+        signal_arr[i] /= REF_TABLE_SIZE; // divide by tablesize to avoid overflow in dotproduct calculation
+    }
+}
+
+
+int16_t buffer_ping[BUFFER_SIZE] __attribute__((aligned(16)));
+int16_t buffer_pong[BUFFER_SIZE] __attribute__((aligned(16)));
+
+int16_t tx_buffer[BUFFER_SIZE] __attribute__((aligned(16))); // dummy data in order to use full duplex
+
+QueueHandle_t dmaQueue;
+
+
+
+typedef enum {
+    BUFFER_PING = 0,
+    BUFFER_PONG = 1,
+} buffer_id_t;
+
+typedef struct {
+    buffer_id_t buf_id;
+    uint64_t end_time_us;
+} dma_event_t;
+
+spi_device_handle_t spi;
+spi_transaction_t trans_ping, trans_pong;
+
+
+// LEDC channel configuration for PWM conversion trigger
+void init_conversion_trigger(void)
+{
+    ledc_timer_config_t ledc_timer = {
+        .duty_resolution = LEDC_TIMER_8_BIT,  // Square wave
+        .freq_hz = 625,                     // 625 kHz conversion trigger/sampling frequency 80 MHz/128 allows us to get an even number of readings per sample
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .timer_num = LEDC_TIMER_0,
+        .clk_cfg = LEDC_AUTO_CLK,
+    };
+    ledc_timer_config(&ledc_timer);
+
+    // Configure LEDC channel
+    ledc_channel_config_t ledc_channel = {
+        .channel    = LEDC_CHANNEL_0,
+        .duty       = 8,
+        .gpio_num   = PIN_NUM_CNVST,
+        .speed_mode = LEDC_LOW_SPEED_MODE,
+        .hpoint     = 0,
+        .timer_sel  = LEDC_TIMER_0
+    };
+    ledc_channel_config(&ledc_channel);
+    ESP_LOGI(TAG, "Conversion trigger PWM configured on GPIO %d", PIN_NUM_CNVST);
+}
+
+// Acquisition task: continuously collects SPI DMA transactions.
+// This task runs with minimal CPU intervention because DMA fills the buffers.
+void acquisition_task(void *pvParameters)
+{
+    spi_transaction_t *rtrans;
+    dma_event_t event;
+    while (1) {
+        ESP_ERROR_CHECK(spi_device_get_trans_result(spi, &rtrans, portMAX_DELAY)); // Waits until dma is finished
+        event.buf_id = (buffer_id_t) rtrans->user;
+        event.end_time_us = esp_timer_get_time();
+        xQueueSend(dmaQueue, &event, portMAX_DELAY); // Notify the processing task that this buffer is ready.
+    }
+}
+
+void processing_task(void *pvParameters) {
+    dma_event_t event;
+    while(1) {
+        // waits for notification that a DMA buffer is finished
+        if(xQueueReceive(dmaQueue, &event, portMAX_DELAY) == pdTRUE) {
+            if (event.buf_id == BUFFER_PING) {
+                ESP_ERROR_CHECK(spi_device_queue_trans(spi, &trans_ping, portMAX_DELAY)); // requeue the ping transaction
+                //TODO: process ping data 
+                // Log the first 32 bytes (or fewer if BUFFER_SIZE is smaller)
+                char buf[256];
+                int len = 0;
+                for (int j = 0; j < 32 && j < BUFFER_SIZE; j++) {
+                    len += snprintf(buf + len, sizeof(buf) - len, "%02X ", buffer_ping[j]);
+                }
+                ESP_LOGI(TAG, "%s", buf);
+            } else {
+                ESP_ERROR_CHECK(spi_device_queue_trans(spi, &trans_pong, portMAX_DELAY)); 
+                //TODO: process pong data
+                char buf[256];
+                int len = 0;
+                for (int j = 0; j < 32 && j < BUFFER_SIZE; j++) {
+                    len += snprintf(buf + len, sizeof(buf) - len, "%02X ", buffer_pong[j]);
+                }
+                ESP_LOGI(TAG, "%s", buf);
+            }
+        }
+    }
+}
+
+
+
+
+
+void app_main(void) {
+    //initialize_sine_table();
+    esp_err_t ret;
+
+    memset(tx_buffer, 0, sizeof(tx_buffer)); // fill tx buffer with dummy data for full duplex
+
+    memset(buffer_ping, 1, sizeof(buffer_ping));
+    memset(buffer_pong, 0, sizeof(buffer_pong));
+
+    init_conversion_trigger();
+
+    dmaQueue = xQueueCreate(10, sizeof(buffer_id_t));
+
+    if (dmaQueue == NULL) {
+        ESP_LOGE(TAG, "Failed to create DMA queue");
+        return;
+    }
+
+
+    spi_bus_config_t buscfg = {
+        .miso_io_num = PIN_NUM_MISO,
+        .mosi_io_num = PIN_NUM_MOSI,
+        .sclk_io_num = PIN_NUM_CLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = BUFFER_SIZE * sizeof(int16_t),
+        .flags = 0,
+        .intr_flags = 0,
+    };
+    ret = spi_bus_initialize(VSPI_HOST, &buscfg, 1);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "spi_bus_initialize failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    spi_device_interface_config_t devcfg = {
+        .clock_speed_hz = 40000, // 40 MHz
+        .mode = 0,
+        .spics_io_num = PIN_NUM_CS,
+        .queue_size = 2, // Allows queuing up another device for double buffering (ping pong buffering)
+        .flags = 0, // Full duplex for more consistent transmission, output is not used
+    };
+    ret = spi_bus_add_device(VSPI_HOST, &devcfg, &spi);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failted to add SPI device: %s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(TAG, "SPI device added successfully");
+
+    memset(&trans_ping, 0, sizeof(trans_ping));
+    trans_ping.length = BUFFER_SIZE * 16;
+    trans_ping.tx_buffer = tx_buffer;
+    trans_ping.rx_buffer = buffer_ping;
+    trans_ping.user = (void *) BUFFER_PING;
+
+    memset(&trans_pong, 0, sizeof(trans_pong));
+    trans_pong.length = BUFFER_SIZE * 16;
+    trans_pong.tx_buffer = tx_buffer;
+    trans_pong.rx_buffer = buffer_pong;
+    trans_pong.user = (void *) BUFFER_PONG;
+
+    ret = spi_device_queue_trans(spi, &trans_ping, portMAX_DELAY);
+    if(ret != ESP_OK) {
+        ESP_LOGE(TAG, "Queue trans ping failed: %s", esp_err_to_name(ret));
+        return;
+    }
+
+    ret = spi_device_queue_trans(spi, &trans_pong, portMAX_DELAY);
+    if(ret != ESP_OK) {
+        ESP_LOGE(TAG, "Queue trans pong failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    // create freeRTOS tasks that will run continuously
+    xTaskCreate(acquisition_task, "acquisition_task", 4096, NULL, 5, NULL);
+    xTaskCreate(processing_task, "processing_task", 4096, NULL, 5, NULL);
+}
