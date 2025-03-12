@@ -1,0 +1,82 @@
+#include <stdio.h>
+#include <string.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "driver/spi_slave.h"
+#include "esp_log.h"
+
+static const char *TAG = "FakeADC";
+
+// GPIO pins for the slave (adjust as needed)
+#define PIN_SLAVE_MISO 25
+#define PIN_SLAVE_MOSI 26
+#define PIN_SLAVE_SCLK 27
+#define PIN_SLAVE_CS   14
+
+// Number of 16-bit words per transaction (matching master)
+#define SLAVE_BUFFER_SIZE 1024
+
+// Fake ADC value; we'll use the same value for all samples
+static uint16_t fake_adc_value = 0x1234;
+
+// Buffers for SPI slave (TX and RX)
+static uint16_t slave_tx_buffer[SLAVE_BUFFER_SIZE] __attribute__((aligned(16)));
+static uint16_t slave_rx_buffer[SLAVE_BUFFER_SIZE] __attribute__((aligned(16)));
+
+// Minimal callback implementations. Avoid using ESP_LOG functions here.
+static void spi_slave_post_setup_cb(spi_slave_transaction_t *trans) {
+    // Do not call blocking functions or ESP_LOG here.
+}
+static void spi_slave_post_trans_cb(spi_slave_transaction_t *trans) {
+    // Optionally, set a flag or do minimal work.
+}
+
+void app_main(void)
+{
+    // Fill the TX buffer with the fake ADC value
+    for (int i = 0; i < SLAVE_BUFFER_SIZE; i++) {
+        slave_tx_buffer[i] = fake_adc_value;
+    }
+
+    spi_bus_config_t buscfg = {
+        .mosi_io_num = PIN_SLAVE_MOSI,
+        .miso_io_num = PIN_SLAVE_MISO,
+        .sclk_io_num = PIN_SLAVE_SCLK,
+        .quadwp_io_num = -1,
+        .quadhd_io_num = -1,
+        .max_transfer_sz = SLAVE_BUFFER_SIZE * sizeof(uint16_t),
+        .flags = 0,
+    };
+
+    spi_slave_interface_config_t slvcfg = {
+        .mode = 0, // SPI mode 0 (match master)
+        .spics_io_num = PIN_SLAVE_CS,
+        .queue_size = 3, // Allow a few queued transactions
+        .flags = 0,
+        .post_setup_cb = spi_slave_post_setup_cb,
+        .post_trans_cb = spi_slave_post_trans_cb,
+    };
+
+    ESP_ERROR_CHECK(spi_slave_initialize(VSPI_HOST, &buscfg, &slvcfg, 1));
+    ESP_LOGI(TAG, "SPI slave initialized. Waiting for transactions...");
+
+    spi_slave_transaction_t t;
+    memset(&t, 0, sizeof(t));
+    t.length = SLAVE_BUFFER_SIZE * 16; // total bits = 1024 words * 16 bits
+    t.tx_buffer = slave_tx_buffer;
+    t.rx_buffer = slave_rx_buffer;
+
+    while (1) {
+        // Wait for a transaction from the master
+        ESP_ERROR_CHECK(spi_slave_transmit(VSPI_HOST, &t, portMAX_DELAY));
+        ESP_LOGI(TAG, "Transaction completed. Received %d words", t.length/16);
+
+        // For testing, you could update fake_adc_value if desired:
+        // fake_adc_value++;
+        // for (int i = 0; i < SLAVE_BUFFER_SIZE; i++) {
+        //     slave_tx_buffer[i] = fake_adc_value;
+        // }
+
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
