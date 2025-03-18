@@ -1,1 +1,1 @@
-# Gruppe-6-elsys-2025
+# Gruppe-2-elsys-2025
