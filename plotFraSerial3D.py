@@ -17,7 +17,10 @@ nodes = [
     (0.33, 0.33, 0.12)
 ]
 
-SERIAL_PORT = 'COM6'
+
+
+
+SERIAL_PORT = 'COM5'
 BAUD_RATE = 115200
 
 # Parameters for the net object:
