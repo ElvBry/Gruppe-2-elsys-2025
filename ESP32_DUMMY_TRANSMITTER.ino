@@ -102,7 +102,7 @@ uint8_t transmitterPtr = 0;
 const double propagationSpeed = 0.00034; // Speed of sound in m/µs
 
 void setup() {
-  //Serial.begin(115200);
+  Serial.begin(115200);
   for (int i = 0; i < NUM_RECEIVERS; i++) {
     pinMode(RECEIVER_PIN_ARRAY[i], OUTPUT);
     setPinLow(RECEIVER_PIN_ARRAY[i]);
@@ -115,7 +115,7 @@ void loop() {
   for (int i = 0; i < NUM_RECEIVERS; i++) {
     events[i].pin = RECEIVER_PIN_ARRAY[i];
     double d = distance(TRANSMITTER_ARRAY[transmitterPtr], RECEIVER_ARRAY[i]);
-    events[i].delay_us = static_cast<uint32_t>(d / propagationSpeed);
+    events[i].delay_us = static_cast<uint32_t>((d / propagationSpeed));
   }
 
 
@@ -124,12 +124,12 @@ void loop() {
     min(events[2].delay_us,events[3].delay_us)
   );
 
-  /*
+  
   Serial.println("t1:" + String(events[0].delay_us-currentTime));
   Serial.println("t2:" + String(events[1].delay_us-currentTime));
   Serial.println("t3:" + String(events[2].delay_us-currentTime));
   Serial.println("t4:" + String(events[3].delay_us-currentTime));
-  */
+  
 
 
   for (int i = 0; i < NUM_RECEIVERS - 1; i++) {
