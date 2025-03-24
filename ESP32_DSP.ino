@@ -35,7 +35,7 @@ point RECEIVER_ARRAY[4] = {
 double propagationSpeed = 0.00034; // Speed of sound in m/µs (340 m/s)
 point initialGuess = {0.3, 0.3, 0.3};
 
-const uint64_t measurementTimeout = 5;  // 5 ms timeout
+const uint64_t measurementTimeout = 10;  // 5 ms timeout
 uint64_t measurementStartTime = 0;
 
 //------------------------
@@ -257,7 +257,7 @@ void loop() {
       }
       // Call the revised TDOA calculation function.
       calculateTDOAposition3D(RECEIVER_ARRAY, TDOA_ARRAY, propagationSpeed, initialGuess);
-      /*
+      
       Serial.print("t1: ");
       Serial.println(TDOA_ARRAY[0]);
       Serial.print("t2: ");
@@ -266,7 +266,6 @@ void loop() {
       Serial.println(TDOA_ARRAY[2]);
       Serial.print("t4: ");
       Serial.println(TDOA_ARRAY[3]);
-      */
     }
     // Reset timestamps for the next measurement cycle.
     for (size_t i = 0; i < 4; i++) {
@@ -274,5 +273,7 @@ void loop() {
     }
     measurementStartTime = esp_timer_get_time();
   }
-  delay(10);
+  delay(1);
 }
+
+
