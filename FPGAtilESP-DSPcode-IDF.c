@@ -19,8 +19,8 @@
 #define PIN_NUM_MOSI 23 // not used but full duplex is more synchronised
 #define PIN_NUM_CLK  18
 
-#define BUFFER_SIZE 4000 // buffer can not exceed 4092
-#define REDUCED_BUFFER_SIZE 1000
+#define BUFFER_SIZE 240 // buffer can not exceed 255
+#define REDUCED_BUFFER_SIZE 
 
 #define PI 3.14159265358979323846
 #define SAMPLE_FREQUENCY 390000
@@ -158,9 +158,7 @@ bool align_data_acquisition(void) {
             esp_rom_delay_us(25);
             gpio_set_level(PIN_NUM_CLK, 0);
             esp_rom_delay_us(25);
-            }
-        //gpio_reset_pin(PIN_NUM_CLK); // Reset pins for reconfiguration by SPI driver
-        //gpio_reset_pin(PIN_NUM_MISO);
+        }
         char bitString[65];
         uint64_t hexVal = 0;
         for (int i = 0; i < 64; i++) {
@@ -182,7 +180,36 @@ bool align_data_acquisition(void) {
 
     return 0; // Failed to read correct data from buffer
 }
+// holds clk pin high for over 1 ms in order to communicate to FPGA that it should reset its output buffer
+void reset_FPGA_output() {
+    // Configure the CLK pin as a GPIO output
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << PIN_NUM_CLK),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+    gpio_set_level(PIN_NUM_CLK, 1);
+    esp_rom_delay_us(10000);
+    gpio_set_level(PIN_NUM_CLK, 0);
+    esp_rom_delay_us(10);
+    gpio_set_level(PIN_NUM_CLK, 1);
+    esp_rom_delay_us(10);
+    gpio_set_level(PIN_NUM_CLK, 0);
+}
 
+
+static inline uint16_t swap_bytes(uint16_t val) {
+    return (val >> 8) | (val << 8);
+}
+
+void swap_buffer_bytes(uint16_t *buffer, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        buffer[i] = swap_bytes(buffer[i]);
+    }
+}
 
 
 
@@ -214,7 +241,7 @@ void acquisition_task(void *pvParameters) {
 
 void processing_task(void *pvParameters) {
     dma_event_t event;
-    static uint8_t printCount = 0;
+    static uint32_t printCount = 0;
 
     while(1) {
         // waits for notification that a DMA buffer is finished
@@ -222,9 +249,9 @@ void processing_task(void *pvParameters) {
             if (event.buf_id == BUFFER_PING) {
                 ESP_ERROR_CHECK(spi_device_queue_trans(spi, &trans_ping, portMAX_DELAY)); // requeue the ping transaction
                 //TODO: process ping data 
-                if(printCount % 100 == 0) {
+                if(printCount % 1000 == 0) {
                     //if ((buffer_ping[0] >> 12) != 0 || buffer_ping[1] >> 12 != 1 || buffer_ping[2] >> 12 != 2 || buffer_ping[4] >> 12 != 3) esp_restart();
-
+                    swap_buffer_bytes(buffer_ping, 8); // each uint16_t is two bytes in 
                     ESP_LOGI(TAG, "Ping Buffer first 4 samples: HEX: %04X %04X %04X %04X %04X %04X %04X %04X, DEC: %d %d %d %d %d %d %d %d", 
                         buffer_ping[0], buffer_ping[1], buffer_ping[2], buffer_ping[3], buffer_ping[4], buffer_ping[5], buffer_ping[6], buffer_ping[7],
                         buffer_ping[0], buffer_ping[1], buffer_ping[2], buffer_ping[3], buffer_ping[4], buffer_ping[5], buffer_ping[6], buffer_ping[7]);
@@ -232,7 +259,8 @@ void processing_task(void *pvParameters) {
             } else {
                 ESP_ERROR_CHECK(spi_device_queue_trans(spi, &trans_pong, portMAX_DELAY)); 
                 //TODO: process pong data
-                if(printCount % 100 == 0) {
+                swap_buffer_bytes(buffer_pong, 8);
+                if(printCount % 1000 == 0) {
                     ESP_LOGI(TAG, "Pong Buffer first 4 samples: HEX: %04X %04X %04X %04X, DEC: %d %d %d %d", 
                         buffer_pong[0], buffer_pong[1], buffer_pong[2], buffer_pong[3],
                         buffer_pong[0], buffer_pong[1], buffer_pong[2], buffer_pong[3]);
@@ -251,7 +279,7 @@ void app_main(void) {
     //initialize_sine_table();
     esp_err_t ret;
 
-    memset(tx_buffer, 0, sizeof(tx_buffer)); // fill tx buffer with dummy data for full duplex
+    memset(tx_buffer, 0, sizeof(tx_buffer)); // Fill tx buffer with dummy data for full duplex
 
     memset(buffer_ping, 1, sizeof(buffer_ping));
     memset(buffer_pong, 0, sizeof(buffer_pong));
@@ -263,6 +291,27 @@ void app_main(void) {
         return;
     }
 
+    //reset_FPGA_output(); // holds clk pin high for over 1 ms in order to communicate to FPGA that it should reset its output buffer
+    // Configure the CLK pin as a GPIO output
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << PIN_NUM_CLK),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+    gpio_set_level(PIN_NUM_CLK, 1);
+    esp_rom_delay_us(1000000);
+    gpio_set_level(PIN_NUM_CLK, 0);
+    esp_rom_delay_us(1000);
+    for(int i = 0; i < 63; i++) {
+        gpio_set_level(PIN_NUM_CLK, 1);
+        esp_rom_delay_us(25);
+        gpio_set_level(PIN_NUM_CLK, 0);
+        esp_rom_delay_us(25);
+    }
+
 
     spi_bus_config_t buscfg = {
         .miso_io_num = PIN_NUM_MISO,
@@ -270,15 +319,17 @@ void app_main(void) {
         .sclk_io_num = PIN_NUM_CLK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = 4 * sizeof(uint16_t), // first reading, gets changed to BUFFER_SIZE afterwards
+        .max_transfer_sz = 4 * sizeof(uint16_t), // First reading, gets changed to BUFFER_SIZE afterwards
         .flags = 0,
         .intr_flags = 0,
     };
+    /*
     ret = spi_bus_initialize(VSPI_HOST, &buscfg, 1);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "spi_bus_initialize failed: %s", esp_err_to_name(ret));
         return;
     }
+    */
    
 
     spi_device_interface_config_t devcfg = {
@@ -288,13 +339,13 @@ void app_main(void) {
         .queue_size = 2, // Allows queuing up another device for double buffering (ping pong buffering)
         .flags = 0, // Full duplex for more consistent transmission, output is not used
     };
+    /*
     ret = spi_bus_add_device(VSPI_HOST, &devcfg, &spi);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failted to add alignment SPI device: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "Failed to add alignment SPI device: %s", esp_err_to_name(ret));
         return;
     }
     ESP_LOGI(TAG, "Alignment SPI device added successfully");
-
     // Set up a transaction that reads 4 16-bit words (64 bits)
     spi_transaction_t trans_align = {0};
     trans_align.length = 4 * 16;
@@ -314,10 +365,11 @@ void app_main(void) {
     ESP_LOGI(TAG, "Buffers aligned successfully");
     spi_bus_remove_device(spi);
     spi_bus_free(VSPI_HOST);
+    */
 
 
     // Reinitialize the SPI bus with the full buffer size for continuous transfers.
-    buscfg.max_transfer_sz = BUFFER_SIZE * sizeof(uint16_t);
+    buscfg.max_transfer_sz = BUFFER_SIZE * 2;
     ret = spi_bus_initialize(VSPI_HOST, &buscfg, 1);
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "spi_bus_initialize continuous failed: %s", esp_err_to_name(ret));
