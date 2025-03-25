@@ -12,6 +12,7 @@
 #include "esp_log.h"
 #include "dsps_dotprod.h"
 #include "esp_timer.h"
+#include "esp_system.h"
 
 
 #define PIN_NUM_MISO 19
@@ -31,80 +32,11 @@
 #define secondIndex 16
 #define thirdIndex 32
 
+#define extraShift 0
+
 static const char *TAG = "TDOA_DSP";
 
-// Data is read as continuous stream of bits. FPGA buffer sends data as stream of 16 bit samples where first 4 bits are ID.
-// Function makes sure that input and output buffers data transfers are aligned
-bool align_data_acquisition(void) {
-    // Configure the CLK pin as a GPIO output
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << PIN_NUM_CLK),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&io_conf);
-    
-    io_conf.pin_bit_mask = (1ULL << PIN_NUM_MISO); // Configure the MISO pin as a GPIO input
-    io_conf.mode = GPIO_MODE_INPUT;
-    gpio_config(&io_conf);
 
-
-    bool data_buffer[64];
-    // Read one full buffer
-    for (int i = 0; i < 64; i++) {
-        gpio_set_level(PIN_NUM_CLK, 1);
-        esp_rom_delay_us(250);
-        data_buffer[i] = gpio_get_level(PIN_NUM_MISO); // Store the current bit on MISO
-        gpio_set_level(PIN_NUM_CLK, 0);
-        esp_rom_delay_us(250);
-    }
-    char bitString[65];  // 64 bits plus null terminator
-    for (int i = 0; i < 64; i++) {
-        bitString[i] = data_buffer[i] ? '1' : '0';
-    }
-    bitString[64] = '\0';
-    ESP_LOGI(TAG, "Data buffer: %s", bitString);
-
-
-    for(int i = 0; i < 19; i++) { // Guaranteed to have full first 4 bits of ID from one 16 bit sample if we read 19 bits
-        if((data_buffer[i] == 0 && data_buffer[i+secondIndex] == 0) && (data_buffer[i+1] == 0 && data_buffer[i+secondIndex+1] == 0)) {
-           uint8_t ID1, ID2, ID3; // Two bit values to store IDs
-
-           ID1 = (data_buffer[i+2] << 1) | data_buffer[i+3];
-
-           ID2 = (data_buffer[i+secondIndex+2] << 1) | data_buffer[i+secondIndex+3];
-
-           if((ID2 != ID1 +1) && !(ID1 == 3 && ID2 == 0)) continue;
-
-           if(data_buffer[i+thirdIndex] == 0 && data_buffer[i+thirdIndex+1] == 0 ) {
-            ID3 = (data_buffer[i+thirdIndex+2] << 1) | data_buffer[i+thirdIndex+3];
-
-            if((ID3 != ID2 +1) && !(ID2 == 3 && ID3 == 0)) continue;
-
-            int8_t start_index = ID1*16 - i;
-            // Clock out bits until the next bit is the start of our 64 bit word
-            for(int j = 0; j < 64 - start_index; j++) {
-                gpio_set_level(PIN_NUM_CLK, 1);
-                esp_rom_delay_us(25);
-                gpio_set_level(PIN_NUM_CLK, 0);
-                esp_rom_delay_us(25);
-                }
-            //gpio_reset_pin(PIN_NUM_CLK); // Reset pins for reconfiguration by SPI driver
-            //gpio_reset_pin(PIN_NUM_MISO);
-            return 1; // Buffers are aligned
-            }
-        }
-    }
-    for (int i = 0; i < 64; i++) {
-        bitString[i] = data_buffer[i] ? '1' : '0';
-    }
-    bitString[64] = '\0';
-    ESP_LOGI(TAG, "Data buffer: %s", bitString);
-
-    return 0; // Failed to read correct data from buffer
-}
 
 
 
@@ -165,13 +97,92 @@ void normalize_signal_arr_Q15(int16_t *signal_arr, uint8_t len) { // normalizes 
     }
 }
 
-
+uint16_t align_data[4] __attribute__((aligned(16)));
 uint16_t buffer_ping[BUFFER_SIZE] __attribute__((aligned(16)));
 uint16_t buffer_pong[BUFFER_SIZE] __attribute__((aligned(16)));
 
 uint16_t tx_buffer[BUFFER_SIZE] __attribute__((aligned(16))); // dummy data in order to use full duplex
 
 QueueHandle_t dmaQueue;
+
+
+// Data is read as continuous stream of bits. FPGA buffer sends data as stream of 16 bit samples where first 4 bits are ID.
+// Function makes sure that input and output buffers data transfers are aligned
+bool align_data_acquisition(void) {
+    // Configure the CLK pin as a GPIO output
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << PIN_NUM_CLK),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+    
+    io_conf.pin_bit_mask = (1ULL << PIN_NUM_MISO); // Configure the MISO pin as a GPIO input
+    io_conf.mode = GPIO_MODE_INPUT;
+    gpio_config(&io_conf);
+
+
+    bool data_buffer[64];
+    
+    int bit_index = 0;
+    // Loop over the first 4 uint16_t values (4 * 16 = 64 bits)
+    for (int word = 0; word < 4; word++) {
+        // Process bits MSB-first (bit 15 to bit 0)
+        for (int bit = 15; bit >= 0; bit--) {
+            data_buffer[bit_index++] = ((align_data[word] >> bit) & 0x1) ? true : false; // Shift the current word right by 'bit' and mask out the lowest bit.
+        }
+    }
+
+    for(int i = 0; i < 19; i++) { // Guaranteed to have full first 4 bits of ID from one 16 bit sample if we read 19 bits
+        uint8_t ID1, ID2, ID3; // Two bit values to store IDs
+
+        ID1 = (data_buffer[i] << 3) | (data_buffer[i+1] << 2) | (data_buffer[i+2] << 1) | data_buffer[i+3];
+        ID2 = (data_buffer[i+secondIndex] << 3) | (data_buffer[i+secondIndex+1] << 2) | (data_buffer[i+secondIndex+2] << 1) | data_buffer[i+secondIndex+3];
+
+        if(((ID2 != ID1 +1) && !(ID1 == 3 && ID2 == 0) ) || (ID1 > 3 || ID2 > 3)) continue;
+
+        ID3 = (data_buffer[i+thirdIndex] << 3) | (data_buffer[i+thirdIndex+1] << 2) | (data_buffer[i+thirdIndex+2] << 1) | (data_buffer[i+thirdIndex+3]);
+
+        if( ((ID3 != ID2 +1) && !(ID2 == 3 && ID3 == 0)) || ID3 > 3) continue;
+
+
+        int8_t start_index = (ID1 * 16) - i;
+        if (start_index < 0) start_index += 64;
+        ESP_LOGI(TAG, "%d", 64 - start_index);
+
+        // Clock out bits until the next bit is the start of our 64 bit word
+        for(int j = 0; j < 64 - start_index + extraShift; j++) {
+            gpio_set_level(PIN_NUM_CLK, 1);
+            esp_rom_delay_us(25);
+            gpio_set_level(PIN_NUM_CLK, 0);
+            esp_rom_delay_us(25);
+            }
+        //gpio_reset_pin(PIN_NUM_CLK); // Reset pins for reconfiguration by SPI driver
+        //gpio_reset_pin(PIN_NUM_MISO);
+        char bitString[65];
+        uint64_t hexVal = 0;
+        for (int i = 0; i < 64; i++) {
+            bool bit = data_buffer[(i + 64 - start_index) % 64];
+            bitString[i] = bit ? '1' : '0';
+            hexVal = (hexVal << 1) | (bit ? 1ULL : 0ULL);
+        }
+        bitString[64] = '\0';
+        ESP_LOGI(TAG, "Data buffer (binary): %s", bitString);
+        ESP_LOGI(TAG, "Data buffer (hex): 0x%016llX", hexVal);
+        return 1; // Buffers are aligned
+    }
+    char bitString[65];
+    for (int i = 0; i < 64; i++) {
+        bitString[i] = data_buffer[i] ? '1' : '0';
+    }
+    bitString[64] = '\0';
+    ESP_LOGI(TAG, "Data buffer: %s", bitString);
+
+    return 0; // Failed to read correct data from buffer
+}
+
 
 
 
@@ -204,13 +215,16 @@ void acquisition_task(void *pvParameters) {
 void processing_task(void *pvParameters) {
     dma_event_t event;
     static uint8_t printCount = 0;
+
     while(1) {
         // waits for notification that a DMA buffer is finished
         if(xQueueReceive(dmaQueue, &event, portMAX_DELAY) == pdTRUE) {
             if (event.buf_id == BUFFER_PING) {
                 ESP_ERROR_CHECK(spi_device_queue_trans(spi, &trans_ping, portMAX_DELAY)); // requeue the ping transaction
                 //TODO: process ping data 
-                if(printCount % 8 == 0) {
+                if(printCount % 100 == 0) {
+                    //if ((buffer_ping[0] >> 12) != 0 || buffer_ping[1] >> 12 != 1 || buffer_ping[2] >> 12 != 2 || buffer_ping[4] >> 12 != 3) esp_restart();
+
                     ESP_LOGI(TAG, "Ping Buffer first 4 samples: HEX: %04X %04X %04X %04X %04X %04X %04X %04X, DEC: %d %d %d %d %d %d %d %d", 
                         buffer_ping[0], buffer_ping[1], buffer_ping[2], buffer_ping[3], buffer_ping[4], buffer_ping[5], buffer_ping[6], buffer_ping[7],
                         buffer_ping[0], buffer_ping[1], buffer_ping[2], buffer_ping[3], buffer_ping[4], buffer_ping[5], buffer_ping[6], buffer_ping[7]);
@@ -218,13 +232,13 @@ void processing_task(void *pvParameters) {
             } else {
                 ESP_ERROR_CHECK(spi_device_queue_trans(spi, &trans_pong, portMAX_DELAY)); 
                 //TODO: process pong data
-                if(printCount % 7 == 0) {
+                if(printCount % 100 == 0) {
                     ESP_LOGI(TAG, "Pong Buffer first 4 samples: HEX: %04X %04X %04X %04X, DEC: %d %d %d %d", 
                         buffer_pong[0], buffer_pong[1], buffer_pong[2], buffer_pong[3],
                         buffer_pong[0], buffer_pong[1], buffer_pong[2], buffer_pong[3]);
                 }
+                printCount++;
             }
-            printCount ++;
         }
     }
 }
@@ -236,17 +250,6 @@ void processing_task(void *pvParameters) {
 void app_main(void) {
     //initialize_sine_table();
     esp_err_t ret;
-
-
-    
-    while(!align_data_acquisition()) { 
-        ESP_LOGI(TAG, "Failed to align buffers");
-        return;
-    }
-    
-    
-    
-    ESP_LOGI(TAG, "Buffers aligned successfully");
 
     memset(tx_buffer, 0, sizeof(tx_buffer)); // fill tx buffer with dummy data for full duplex
 
@@ -267,7 +270,7 @@ void app_main(void) {
         .sclk_io_num = PIN_NUM_CLK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz = BUFFER_SIZE * sizeof(uint16_t),
+        .max_transfer_sz = 4 * sizeof(uint16_t), // first reading, gets changed to BUFFER_SIZE afterwards
         .flags = 0,
         .intr_flags = 0,
     };
@@ -276,6 +279,7 @@ void app_main(void) {
         ESP_LOGE(TAG, "spi_bus_initialize failed: %s", esp_err_to_name(ret));
         return;
     }
+   
 
     spi_device_interface_config_t devcfg = {
         .clock_speed_hz = 24900000, // 24.9MHz 64 bits per sample period
@@ -286,10 +290,46 @@ void app_main(void) {
     };
     ret = spi_bus_add_device(VSPI_HOST, &devcfg, &spi);
     if (ret != ESP_OK) {
-        ESP_LOGE(TAG, "Failted to add SPI device: %s", esp_err_to_name(ret));
+        ESP_LOGE(TAG, "Failted to add alignment SPI device: %s", esp_err_to_name(ret));
         return;
     }
-    ESP_LOGI(TAG, "SPI device added successfully");
+    ESP_LOGI(TAG, "Alignment SPI device added successfully");
+
+    // Set up a transaction that reads 4 16-bit words (64 bits)
+    spi_transaction_t trans_align = {0};
+    trans_align.length = 4 * 16;
+    trans_align.tx_buffer = tx_buffer;
+    trans_align.rx_buffer = align_data; 
+    ret = spi_device_transmit(spi, &trans_align);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Alignment SPI transaction failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(TAG, "Alignment data read: %04X %04X %04X %04X",align_data[0], align_data[1], align_data[2], align_data[3]);
+    
+    while(!align_data_acquisition()) { 
+        ESP_LOGI(TAG, "Failed to align buffers");
+        return;
+    }
+    ESP_LOGI(TAG, "Buffers aligned successfully");
+    spi_bus_remove_device(spi);
+    spi_bus_free(VSPI_HOST);
+
+
+    // Reinitialize the SPI bus with the full buffer size for continuous transfers.
+    buscfg.max_transfer_sz = BUFFER_SIZE * sizeof(uint16_t);
+    ret = spi_bus_initialize(VSPI_HOST, &buscfg, 1);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "spi_bus_initialize continuous failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    ret = spi_bus_add_device(VSPI_HOST, &devcfg, &spi);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "spi_bus_add_device continuous failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    ESP_LOGI(TAG, "SPI device re-added for continuous operation");
+
 
     memset(&trans_ping, 0, sizeof(trans_ping));
     trans_ping.length = BUFFER_SIZE * 16;
