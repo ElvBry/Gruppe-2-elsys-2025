@@ -11,7 +11,7 @@
 
 
 // Found nice values for threshold in signal detection before normalization and binary search detection after normalization
-// Before normalization 15000000000 : 15 e9
+// Before normalization 15000000000 : 15 e9 calculated as 95% chance for true positive when signal amplitude is 10 mv and noise is 5mv
 // After normalization in binary search 650000000000000 : 650 e12
 
 
