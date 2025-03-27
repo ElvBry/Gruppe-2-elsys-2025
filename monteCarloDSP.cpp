@@ -11,8 +11,8 @@
 
 
 // Found nice values for threshold in signal detection before normalization and binary search detection after normalization
-// Before normalization 15000000
-// After normalization in binary search 650000000000000
+// Before normalization 15000000000 : 15 e9
+// After normalization in binary search 650000000000000 : 650 e12
 
 
 using namespace std;
