@@ -5,24 +5,24 @@
 #include <cstdint>
 #include <cstdlib>
 #include <string>
-
+#include <sstream>
 
 using namespace std;
 
+// Constants
 const int SAMPLE_LENGTH = 60;
 const int REF_TABLE_SIZE = 10;
-const int NUM_TESTS_PER_SET = 10;   // Total buffers per simulation set
-const int NUM_SIMULATIONS = 100000;
 
 const double ADC_REF_VOLTAGE = 3.3;
 const int ADC_MAX_VALUE = 4095;
-const double ADC_STEP = ADC_REF_VOLTAGE / ADC_MAX_VALUE; // ~0.00080586 V per count
+const double ADC_STEP = ADC_REF_VOLTAGE / ADC_MAX_VALUE; // ≈0.00080586 V per count
 
 const double NOISE_AMPLITUDE_MV = 5.0;
 const double BURST_AMPLITUDE_MV = 10.0;
 const int NOISE_AMPLITUDE_COUNTS = static_cast<int>(round(NOISE_AMPLITUDE_MV / (ADC_STEP * 1000)));
 const int BURST_AMPLITUDE_COUNTS = static_cast<int>(round(BURST_AMPLITUDE_MV / (ADC_STEP * 1000)));
 
+// Global reference tables (Q15 format)
 vector<int16_t> ref_sine_table_Q15(REF_TABLE_SIZE);
 vector<int16_t> ref_cos_table_Q15(REF_TABLE_SIZE);
 
@@ -42,6 +42,7 @@ void initialize_cos_table_Q15() {
     }
 }
 
+// Computes signal strength as R² + I² over a window of REF_TABLE_SIZE samples.
 uint64_t calculate_signal_strength(const vector<int16_t>& sigArr) {
     int32_t R = 0, I = 0;
     for (int i = 0; i < REF_TABLE_SIZE; i++) {
@@ -51,6 +52,7 @@ uint64_t calculate_signal_strength(const vector<int16_t>& sigArr) {
     return static_cast<uint64_t>(R) * R + static_cast<uint64_t>(I) * I;
 }
 
+// Generates a simulated buffer with noise and, if specified, a sine burst.
 vector<int16_t> simulate_signal(bool hasBurst, int burstStart) {
     vector<int16_t> signal(SAMPLE_LENGTH, 0);
     static random_device rd;
@@ -71,7 +73,8 @@ vector<int16_t> simulate_signal(bool hasBurst, int burstStart) {
     return signal;
 }
 
-void run_simulation(uint64_t threshold, double signalProb) {
+// Runs the simulation over a total number of buffers (numBuffers) and reports detection metrics.
+void run_simulation(uint64_t threshold, double signalProb, unsigned int numBuffers) {
     uint64_t totalSignal = 0, totalNoise = 0;
     uint64_t truePos = 0, falseNeg = 0, trueNeg = 0, falsePos = 0;
     random_device rd;
@@ -79,26 +82,24 @@ void run_simulation(uint64_t threshold, double signalProb) {
     uniform_int_distribution<> burstDist(0, SAMPLE_LENGTH - 5);
     uniform_real_distribution<> probDist(0.0, 1.0);
 
-    for (int sim = 0; sim < NUM_SIMULATIONS; sim++) {
-        for (int test = 0; test < NUM_TESTS_PER_SET; test++) {
-            bool isSignal = (probDist(gen) < signalProb);
-            int burstStart = burstDist(gen);
-            vector<int16_t> signal = simulate_signal(isSignal, burstStart);
-            vector<int16_t> window(signal.end() - REF_TABLE_SIZE, signal.end());
-            uint64_t strength = calculate_signal_strength(window);
-            if (isSignal) {
-                totalSignal++;
-                if (strength >= threshold)
-                    truePos++;
-                else
-                    falseNeg++;
-            } else {
-                totalNoise++;
-                if (strength < threshold)
-                    trueNeg++;
-                else
-                    falsePos++;
-            }
+    for (unsigned int i = 0; i < numBuffers; i++) {
+        bool isSignal = (probDist(gen) < signalProb);
+        int burstStart = burstDist(gen);
+        vector<int16_t> signal = simulate_signal(isSignal, burstStart);
+        vector<int16_t> window(signal.end() - REF_TABLE_SIZE, signal.end());
+        uint64_t strength = calculate_signal_strength(window);
+        if (isSignal) {
+            totalSignal++;
+            if (strength >= threshold)
+                truePos++;
+            else
+                falseNeg++;
+        } else {
+            totalNoise++;
+            if (strength < threshold)
+                trueNeg++;
+            else
+                falsePos++;
         }
     }
 
@@ -108,8 +109,16 @@ void run_simulation(uint64_t threshold, double signalProb) {
     double pctFalsePos = (totalNoise > 0) ? (100.0 * falsePos / totalNoise) : 0.0;
 
     cout << "\nThreshold: " << threshold << "\n";
-    cout << "Noise:Signal ratio: " << (1.0 / signalProb - 1) << ":1\n";
-    cout << "Signal tests: " << totalSignal << "   Noise tests: " << totalNoise << "\n";
+    cout << "Simulation Conditions:\n";
+    if (signalProb == 0.0) {
+        cout << "  All buffers contain noise (0% signal)\n";
+    } else if (signalProb == 1.0) {
+        cout << "  All buffers contain signal (0% noise)\n";
+    } else {
+        double noiseToSignal = (1.0 - signalProb) / signalProb;
+        cout << "  Noise-to-Signal Ratio: " << noiseToSignal << ":1\n";
+    }
+    cout << "Total Signal Buffers: " << totalSignal << "   Total Noise Buffers: " << totalNoise << "\n";
     cout << "True Positives: " << truePos << " (" << pctTruePos << "%)\n";
     cout << "False Negatives: " << falseNeg << " (" << pctFalseNeg << "%)\n";
     cout << "True Negatives: " << trueNeg << " (" << pctTrueNeg << "%)\n";
@@ -120,24 +129,48 @@ int main() {
     initialize_sine_table_Q15();
     initialize_cos_table_Q15();
 
-    cout << "Enter noise:signal ratio (integer): ";
+    cout << "Enter the noise-to-signal ratio:" << endl;
+    cout << "A positive value (e.g., 100) indicates 1 signal for every 100 noise buffers." << endl;
+    cout << "A negative value (e.g., -100) indicates 100 signals for every 1 noise buffer." << endl;
+    cout << "Enter 0 for all noise." << endl;
+    cout << "Your input: ";
     string ratio_input;
     cin >> ratio_input;
     if (ratio_input == "q" || ratio_input == "Q")
         return 0;
-    unsigned int ratioInt = stoul(ratio_input);
-    // Compute signal probability: for a noise:signal ratio of X, signal probability = 1 / (X + 1)
-    double signalProb = 1.0 / (ratioInt + 1.0);
-    cout << "Using signal probability: " << signalProb << " (" << (signalProb * 100) << "% signal buffers)\n";
+    
+    int ratioValue;
+    stringstream ss(ratio_input);
+    ss >> ratioValue;
+    
+    double signalProb = 0.0;
+    if (ratioValue == 0) {
+        signalProb = 0.0;
+    } else if (ratioValue < 0) {
+        int absVal = -ratioValue;
+        signalProb = static_cast<double>(absVal) / (absVal + 1.0);
+    } else {
+        signalProb = 1.0 / (ratioValue + 1.0);
+    }
+    
+    cout << "Using a signal probability of " << signalProb 
+         << " (" << (signalProb * 100) << "% of buffers will contain a signal)." << endl;
+
+    cout << "\nEnter the total number of buffers to analyze: ";
+    string sim_input;
+    cin >> sim_input;
+    if (sim_input == "q" || sim_input == "Q")
+        return 0;
+    unsigned int numBuffers = stoul(sim_input);
 
     while (true) {
-        cout << "Enter threshold (or 'q' to quit): ";
+        cout << "\nEnter a threshold value (or 'q' to quit): ";
         string input;
         cin >> input;
         if (input == "q" || input == "Q")
             break;
         uint64_t threshold = stoull(input);
-        run_simulation(threshold, signalProb);
+        run_simulation(threshold, signalProb, numBuffers);
     }
     return 0;
 }
