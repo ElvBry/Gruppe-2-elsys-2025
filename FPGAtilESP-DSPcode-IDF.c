@@ -70,12 +70,22 @@ void initialize_cos_table_Q15(void) {
 }
 
 
+static inline void remove_dc_offset(int16_t* buffer, uint16_t len) {
+    int32_t sum = 0;
+    for (int i = 0; i < 10; i++) sum += buffer[i];
 
-static inline uint32_t calculate_signal_strength(const int16_t *cosArr, const int16_t *sineArr, const int16_t *sigArr, uint32_t len) {
+    int16_t offset = (int16_t)(sum / 10);
+
+    for (int i = 0; i < len; i++) buffer[i] -= offset;
+}
+
+
+static inline uint64_t calculate_signal_strength(const int16_t *cosArr, const int16_t *sineArr, const int16_t *sigArr, uint32_t len) {
     esp_err_t ret;
     int16_t R; // real component of signal
     int16_t I; // imaginary component of signal
-    uint32_t result = 0; 
+    uint64_t result = 0; 
+    // Computes dotproduct with optimized dsps function
     ret = dsps_dotprod_s16_ae32(cosArr, sigArr, &R, len, 0); //const int16_t *src1, const int16_t *src2, int16_t *dest, int len, int8_t shift
     if (ret != ESP_OK) {
         ESP_LOGE(TAG, "Failed to calculate dotproduct real: %s", esp_err_to_name(ret));
@@ -145,10 +155,14 @@ static inline void deinterleave_and_clear_id(const uint16_t *src, size_t num_sam
 static inline void prosess_buffer(uint16_t *src) {
     swap_buffer_bytes(src,BUFFER_SIZE);
     deinterleave_and_clear_id(src, BUFFER_SIZE, rec1_arr, rec2_arr,rec3_arr,rec4_arr);
-    rec1_arr[0] = (rec1_arr[0] + rec1_arr[1])/2;
+    rec1_arr[0] = (rec1_arr[0] + rec1_arr[1])/2; // first value is often malformed
     rec2_arr[0] = (rec2_arr[0] + rec2_arr[1])/2;
     rec3_arr[0] = (rec3_arr[0] + rec3_arr[1])/2;
     rec4_arr[0] = (rec4_arr[0] + rec4_arr[1])/2;
+    remove_dc_offset(rec1_arr, REDUCED_BUFFER_SIZE);
+    remove_dc_offset(rec1_arr, REDUCED_BUFFER_SIZE);
+    remove_dc_offset(rec1_arr, REDUCED_BUFFER_SIZE);
+    remove_dc_offset(rec1_arr, REDUCED_BUFFER_SIZE);
     normalize_signal_arr_Q15(rec1_arr, REDUCED_BUFFER_SIZE);
     normalize_signal_arr_Q15(rec2_arr, REDUCED_BUFFER_SIZE);
     normalize_signal_arr_Q15(rec3_arr, REDUCED_BUFFER_SIZE);
@@ -325,6 +339,7 @@ void acquisition_task(void *pvParameters) {
 void processing_task(void *pvParameters) {
     dma_event_t event;
     static uint64_t printCount = 0;
+    static uint8_t misalignedSigCount = 0;
     int64_t startCycleCount;
     int64_t endCycleCount;
     while(1) {
@@ -335,15 +350,20 @@ void processing_task(void *pvParameters) {
                 startCycleCount = get_ccount();
                 prosess_buffer(buffer_ping);
                 endCycleCount = get_ccount();
+                misalignedSigCount = (((buffer_ping[0] &0xF000) != 0x0000) ||
+                                      ((buffer_ping[1] &0xF000) != 0x1000) ||
+                                      ((buffer_ping[2] &0xF000) != 0x2000) ||
+                                      ((buffer_ping[3] &0xF000) != 0x3000)) ? misalignedSigCount +1 : 0;
+                                      
                 ESP_ERROR_CHECK(spi_device_queue_trans(spi, &trans_ping, portMAX_DELAY)); // requeue the ping transaction
-                if(printCount % 2000 == 0) {
-                    //if ((buffer_ping[0] >> 12) != 0 || buffer_ping[1] >> 12 != 1 || buffer_ping[2] >> 12 != 2 || buffer_ping[4] >> 12 != 3) esp_restart();
+                if(printCount % 2000 == 0) {                
                     ESP_LOGI(TAG, "Ping Buffer first 8 samples: HEX: %04X %04X %04X %04X %04X %04X %04X %04X, CYCLES: %lld, DEC: %d %d %d %d %d %d %d %d", 
                         buffer_ping[0], buffer_ping[1], buffer_ping[2], buffer_ping[3], buffer_ping[4], buffer_ping[5], buffer_ping[6], buffer_ping[7], endCycleCount-startCycleCount,
                         buffer_ping[0]&0x0FFF, buffer_ping[1]&0x0FFF, buffer_ping[2]&0x0FFF, buffer_ping[3]&0x0FFF, buffer_ping[4]&0x0FFF, buffer_ping[5]&0x0FFF, buffer_ping[6]&0x0FFF, buffer_ping[7]&0x0FFF);
+                    
                 } 
                 if(printCount % 20000 == 0) {
-                    print_buffer_csv_inline(rec4_arr, REDUCED_BUFFER_SIZE);
+                    print_buffer_csv_inline(rec1_arr, REDUCED_BUFFER_SIZE);
                 }
             } else {
                 startCycleCount = get_ccount();
@@ -356,9 +376,13 @@ void processing_task(void *pvParameters) {
                         buffer_pong[0]&0x0FFF, buffer_pong[1]&0x0FFF, buffer_pong[2]&0x0FFF, buffer_pong[3]&0x0FFF, buffer_pong[4]&0x0FFF, buffer_pong[5]&0x0FFF, buffer_pong[6]&0x0FFF, buffer_pong[7]&0x0FFF);
                 }
                 if(printCount % 20000 == 0) {
-                    print_buffer_csv_inline(rec4_arr, REDUCED_BUFFER_SIZE);
+                    print_buffer_csv_inline(rec1_arr, REDUCED_BUFFER_SIZE);
                 }
                 printCount++;
+                if(misalignedSigCount > 10) {
+                    ESP_LOGE(TAG,"MisalignedSigCount greater than 10 RESTARTING...");
+                    esp_restart();
+                }
             }
         }
     }
