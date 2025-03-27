@@ -13,6 +13,8 @@
 #include "dsps_dotprod.h"
 #include "esp_timer.h"
 #include "esp_system.h"
+#include "esp_cpu.h"
+#include <inttypes.h>
 
 
 #define PIN_NUM_MISO 19
@@ -20,7 +22,7 @@
 #define PIN_NUM_CLK  18
 
 #define BUFFER_SIZE 240 // buffer can not exceed 255
-#define REDUCED_BUFFER_SIZE 
+#define REDUCED_BUFFER_SIZE BUFFER_SIZE/4
 
 #define PI 3.14159265358979323846
 #define SAMPLE_FREQUENCY 390000
@@ -36,6 +38,14 @@
 
 static const char *TAG = "TDOA_DSP";
 
+
+
+
+
+
+//
+//  SIGNAL PROCESSING
+//
 
 
 
@@ -61,7 +71,7 @@ void initialize_cos_table_Q15(void) {
 
 
 
-uint32_t calculate_signal_strength(const int16_t *cosArr, const int16_t *sineArr, const int16_t *sigArr, uint32_t len) {
+static inline uint32_t calculate_signal_strength(const int16_t *cosArr, const int16_t *sineArr, const int16_t *sigArr, uint32_t len) {
     esp_err_t ret;
     int16_t R; // real component of signal
     int16_t I; // imaginary component of signal
@@ -80,14 +90,14 @@ uint32_t calculate_signal_strength(const int16_t *cosArr, const int16_t *sineArr
     return result;
 }
 
-
-void normalize_signal_arr_Q15(int16_t *signal_arr, uint8_t len) { // normalizes array of Q15 values between -32768 32767 and divide by tablesize
+// normalizes array of Q15 values between -32768 32767 and divide by tablesize
+static inline void normalize_signal_arr_Q15(int16_t *signal_arr, uint8_t len) {
     int16_t abs_max = 0;
     for (size_t i = 0; i < len; i++) {
         int16_t abs_val = (signal_arr[i] < 0) ? -signal_arr[i] : signal_arr[i];
         if (abs_val > abs_max) abs_max = abs_val;
     }
-
+    if(abs_max == 0) abs_max = 1;
     int32_t scale_factor = ((int32_t)32767 << 15) / abs_max;
 
     for (int i = 0; i < len; i++) {
@@ -97,14 +107,63 @@ void normalize_signal_arr_Q15(int16_t *signal_arr, uint8_t len) { // normalizes 
     }
 }
 
+
 uint16_t align_data[4] __attribute__((aligned(16)));
 uint16_t buffer_ping[BUFFER_SIZE] __attribute__((aligned(16)));
 uint16_t buffer_pong[BUFFER_SIZE] __attribute__((aligned(16)));
 
 uint16_t tx_buffer[BUFFER_SIZE] __attribute__((aligned(16))); // dummy data in order to use full duplex
 
-QueueHandle_t dmaQueue;
+int16_t rec1_arr[REDUCED_BUFFER_SIZE] __attribute__((aligned(16)));
+int16_t rec2_arr[REDUCED_BUFFER_SIZE] __attribute__((aligned(16)));
+int16_t rec3_arr[REDUCED_BUFFER_SIZE] __attribute__((aligned(16)));
+int16_t rec4_arr[REDUCED_BUFFER_SIZE] __attribute__((aligned(16)));
 
+
+static inline uint16_t swap_bytes(uint16_t val) {
+    return (val >> 8) | (val << 8);
+}
+
+void swap_buffer_bytes(uint16_t *buffer, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        buffer[i] = swap_bytes(buffer[i]);
+    }
+}
+
+
+// Splits interlieved buffer into 4 seperate arrays and clears upper 4 bits
+static inline void deinterleave_and_clear_id(const uint16_t *src, size_t num_samples, int16_t *dst1, int16_t *dst2, int16_t *dst3, int16_t *dst4) {
+    const uint16_t *end = src + num_samples;
+    while (src < end) {
+        *dst1++ = *src++ & 0x0FFF;  // Clear the upper 4 ID-bits
+        *dst2++ = *src++ & 0x0FFF;
+        *dst3++ = *src++ & 0x0FFF;
+        *dst4++ = *src++ & 0x0FFF;
+    }
+}
+
+static inline void prosess_buffer(uint16_t *src) {
+    swap_buffer_bytes(src,BUFFER_SIZE);
+    deinterleave_and_clear_id(src, BUFFER_SIZE, rec1_arr, rec2_arr,rec3_arr,rec4_arr);
+    rec1_arr[0] = (rec1_arr[0] + rec1_arr[1])/2;
+    rec2_arr[0] = (rec2_arr[0] + rec2_arr[1])/2;
+    rec3_arr[0] = (rec3_arr[0] + rec3_arr[1])/2;
+    rec4_arr[0] = (rec4_arr[0] + rec4_arr[1])/2;
+    normalize_signal_arr_Q15(rec1_arr, REDUCED_BUFFER_SIZE);
+    normalize_signal_arr_Q15(rec2_arr, REDUCED_BUFFER_SIZE);
+    normalize_signal_arr_Q15(rec3_arr, REDUCED_BUFFER_SIZE);
+    normalize_signal_arr_Q15(rec4_arr, REDUCED_BUFFER_SIZE);
+    uint32_t temp1,temp2,temp3,temp4;
+    temp1 = calculate_signal_strength(ref_cos_table_Q15, ref_sine_table_Q15, rec1_arr, 10);
+    temp2 = calculate_signal_strength(ref_cos_table_Q15, ref_sine_table_Q15, rec2_arr, 10);
+    temp3 = calculate_signal_strength(ref_cos_table_Q15, ref_sine_table_Q15, rec3_arr, 10);
+    temp4 = calculate_signal_strength(ref_cos_table_Q15, ref_sine_table_Q15, rec4_arr, 10);
+}
+
+
+//
+//  PROGRAM SETUP
+//
 
 // Data is read as continuous stream of bits. FPGA buffer sends data as stream of 16 bit samples where first 4 bits are ID.
 // Function makes sure that input and output buffers data transfers are aligned
@@ -180,6 +239,8 @@ bool align_data_acquisition(void) {
 
     return 0; // Failed to read correct data from buffer
 }
+
+
 // holds clk pin high for over 1 ms in order to communicate to FPGA that it should reset its output buffer
 void reset_FPGA_output() {
     // Configure the CLK pin as a GPIO output
@@ -192,24 +253,45 @@ void reset_FPGA_output() {
     };
     gpio_config(&io_conf);
     gpio_set_level(PIN_NUM_CLK, 1);
-    esp_rom_delay_us(10000);
+    esp_rom_delay_us(1000000);
     gpio_set_level(PIN_NUM_CLK, 0);
-    esp_rom_delay_us(10);
-    gpio_set_level(PIN_NUM_CLK, 1);
-    esp_rom_delay_us(10);
-    gpio_set_level(PIN_NUM_CLK, 0);
-}
-
-
-static inline uint16_t swap_bytes(uint16_t val) {
-    return (val >> 8) | (val << 8);
-}
-
-void swap_buffer_bytes(uint16_t *buffer, size_t len) {
-    for (size_t i = 0; i < len; i++) {
-        buffer[i] = swap_bytes(buffer[i]);
+    esp_rom_delay_us(1000);
+    /* debugging timing
+    for(int i = 0; i < 63; i++) {
+        gpio_set_level(PIN_NUM_CLK, 1);
+        esp_rom_delay_us(25);
+        gpio_set_level(PIN_NUM_CLK, 0);
+        esp_rom_delay_us(25);
     }
+    */
 }
+
+
+//
+//  TASKS
+//
+
+void print_buffer_csv_inline(const int16_t *buffer, size_t len) {
+    char line[2048] = {0};
+    char temp[16];
+
+    for (size_t i = 0; i < len; i++) {
+        snprintf(temp, sizeof(temp), "%d", buffer[i]);
+        strcat(line, temp);
+        if (i < len - 1) strcat(line, ",");
+    }
+
+    ESP_LOGI(TAG, "%s", line);
+}
+
+// Returns cycle count for debugging and testing
+static inline uint32_t get_ccount(void) {
+    uint32_t ccount;
+    __asm__ __volatile__("rsr.ccount %0" : "=a" (ccount));
+    return ccount;
+}
+
+QueueHandle_t dmaQueue;
 
 
 
@@ -239,31 +321,42 @@ void acquisition_task(void *pvParameters) {
     }
 }
 
+
 void processing_task(void *pvParameters) {
     dma_event_t event;
-    static uint32_t printCount = 0;
-
+    static uint64_t printCount = 0;
+    int64_t startCycleCount;
+    int64_t endCycleCount;
     while(1) {
         // waits for notification that a DMA buffer is finished
         if(xQueueReceive(dmaQueue, &event, portMAX_DELAY) == pdTRUE) {
+            
             if (event.buf_id == BUFFER_PING) {
+                startCycleCount = get_ccount();
+                prosess_buffer(buffer_ping);
+                endCycleCount = get_ccount();
                 ESP_ERROR_CHECK(spi_device_queue_trans(spi, &trans_ping, portMAX_DELAY)); // requeue the ping transaction
-                //TODO: process ping data 
-                if(printCount % 1000 == 0) {
+                if(printCount % 2000 == 0) {
                     //if ((buffer_ping[0] >> 12) != 0 || buffer_ping[1] >> 12 != 1 || buffer_ping[2] >> 12 != 2 || buffer_ping[4] >> 12 != 3) esp_restart();
-                    swap_buffer_bytes(buffer_ping, 8); // each uint16_t is two bytes in 
-                    ESP_LOGI(TAG, "Ping Buffer first 4 samples: HEX: %04X %04X %04X %04X %04X %04X %04X %04X, DEC: %d %d %d %d %d %d %d %d", 
-                        buffer_ping[0], buffer_ping[1], buffer_ping[2], buffer_ping[3], buffer_ping[4], buffer_ping[5], buffer_ping[6], buffer_ping[7],
-                        buffer_ping[0], buffer_ping[1], buffer_ping[2], buffer_ping[3], buffer_ping[4], buffer_ping[5], buffer_ping[6], buffer_ping[7]);
+                    ESP_LOGI(TAG, "Ping Buffer first 8 samples: HEX: %04X %04X %04X %04X %04X %04X %04X %04X, CYCLES: %lld, DEC: %d %d %d %d %d %d %d %d", 
+                        buffer_ping[0], buffer_ping[1], buffer_ping[2], buffer_ping[3], buffer_ping[4], buffer_ping[5], buffer_ping[6], buffer_ping[7], endCycleCount-startCycleCount,
+                        buffer_ping[0]&0x0FFF, buffer_ping[1]&0x0FFF, buffer_ping[2]&0x0FFF, buffer_ping[3]&0x0FFF, buffer_ping[4]&0x0FFF, buffer_ping[5]&0x0FFF, buffer_ping[6]&0x0FFF, buffer_ping[7]&0x0FFF);
+                } 
+                if(printCount % 20000 == 0) {
+                    print_buffer_csv_inline(rec4_arr, REDUCED_BUFFER_SIZE);
                 }
             } else {
+                startCycleCount = get_ccount();
+                prosess_buffer(buffer_pong);
+                endCycleCount = get_ccount();
                 ESP_ERROR_CHECK(spi_device_queue_trans(spi, &trans_pong, portMAX_DELAY)); 
-                //TODO: process pong data
-                swap_buffer_bytes(buffer_pong, 8);
-                if(printCount % 1000 == 0) {
-                    ESP_LOGI(TAG, "Pong Buffer first 4 samples: HEX: %04X %04X %04X %04X, DEC: %d %d %d %d", 
-                        buffer_pong[0], buffer_pong[1], buffer_pong[2], buffer_pong[3],
-                        buffer_pong[0], buffer_pong[1], buffer_pong[2], buffer_pong[3]);
+                if(printCount % 2000 == 0) {
+                    ESP_LOGI(TAG, "Pong Buffer first 8 samples: HEX: %04X %04X %04X %04X %04X %04X %04X %04X, CYCLES: %lld, DEC: %d %d %d %d %d %d %d %d", 
+                        buffer_pong[0], buffer_pong[1], buffer_pong[2], buffer_pong[3], buffer_pong[4], buffer_pong[5], buffer_pong[6], buffer_pong[7], endCycleCount-startCycleCount,
+                        buffer_pong[0]&0x0FFF, buffer_pong[1]&0x0FFF, buffer_pong[2]&0x0FFF, buffer_pong[3]&0x0FFF, buffer_pong[4]&0x0FFF, buffer_pong[5]&0x0FFF, buffer_pong[6]&0x0FFF, buffer_pong[7]&0x0FFF);
+                }
+                if(printCount % 20000 == 0) {
+                    print_buffer_csv_inline(rec4_arr, REDUCED_BUFFER_SIZE);
                 }
                 printCount++;
             }
@@ -276,12 +369,13 @@ void processing_task(void *pvParameters) {
 
 
 void app_main(void) {
-    //initialize_sine_table();
+    initialize_sine_table_Q15();
+    initialize_cos_table_Q15();
     esp_err_t ret;
 
     memset(tx_buffer, 0, sizeof(tx_buffer)); // Fill tx buffer with dummy data for full duplex
 
-    memset(buffer_ping, 1, sizeof(buffer_ping));
+    memset(buffer_ping, 0, sizeof(buffer_ping));
     memset(buffer_pong, 0, sizeof(buffer_pong));
 
     dmaQueue = xQueueCreate(10, sizeof(buffer_id_t));
@@ -291,26 +385,7 @@ void app_main(void) {
         return;
     }
 
-    //reset_FPGA_output(); // holds clk pin high for over 1 ms in order to communicate to FPGA that it should reset its output buffer
-    // Configure the CLK pin as a GPIO output
-    gpio_config_t io_conf = {
-        .pin_bit_mask = (1ULL << PIN_NUM_CLK),
-        .mode = GPIO_MODE_OUTPUT,
-        .pull_up_en = GPIO_PULLUP_DISABLE,
-        .pull_down_en = GPIO_PULLDOWN_DISABLE,
-        .intr_type = GPIO_INTR_DISABLE,
-    };
-    gpio_config(&io_conf);
-    gpio_set_level(PIN_NUM_CLK, 1);
-    esp_rom_delay_us(1000000);
-    gpio_set_level(PIN_NUM_CLK, 0);
-    esp_rom_delay_us(1000);
-    for(int i = 0; i < 63; i++) {
-        gpio_set_level(PIN_NUM_CLK, 1);
-        esp_rom_delay_us(25);
-        gpio_set_level(PIN_NUM_CLK, 0);
-        esp_rom_delay_us(25);
-    }
+    reset_FPGA_output(); // holds clk pin high for over 1 ms in order to communicate to FPGA that it should reset its output buffer
 
 
     spi_bus_config_t buscfg = {
