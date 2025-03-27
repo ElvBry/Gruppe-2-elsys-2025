@@ -28,7 +28,15 @@
 #define SAMPLE_FREQUENCY 390000
 #define TARGET_FREQUENCY 39000
 
+#define SIGNAL_THRESHOLD 15000000000ULL
+#define BINARY_SEARCH_THRESHOLD 650000000000000ULL
+#define BINARY_SEARCH_STEPS 6
+
 #define REF_TABLE_SIZE 10
+
+#define NUM_RECEIVERS 4
+
+
 
 
 #define secondIndex 16
@@ -40,15 +48,9 @@ static const char *TAG = "TDOA_DSP";
 
 
 
-
-
-
 //
 //  SIGNAL PROCESSING
 //
-
-
-
 
 int16_t ref_sine_table_Q15[REF_TABLE_SIZE] __attribute__((aligned(16))); // global lookuptable for target frequency sine. Format: Q15
 int16_t ref_cos_table_Q15[REF_TABLE_SIZE] __attribute__((aligned(16))); 
@@ -67,6 +69,14 @@ void initialize_cos_table_Q15(void) {
         double value = cos(i*angleStep)/REF_TABLE_SIZE;
         ref_cos_table_Q15[i] = (int16_t)(value * 32767.0);
     }
+}
+
+static inline uint64_t calculate_arrival_time(uint64_t end_time_us, uint8_t start_index) {
+    double sample_period_us = 1000000.0 / SAMPLE_FREQUENCY;
+    double delay_us = start_index * sample_period_us; // Calculate the delay as a floating point value for better precision
+   
+    uint64_t arrival_time_us = end_time_us - (uint64_t)(delay_us + 0.5);
+    return arrival_time_us;
 }
 
 
@@ -118,6 +128,39 @@ static inline void normalize_signal_arr_Q15(int16_t *signal_arr, uint8_t len) {
 }
 
 
+static inline bool signalPresent(const int16_t *src, uint8_t len) {
+    return calculate_signal_strength(ref_cos_table_Q15, ref_sine_table_Q15, &src[REDUCED_BUFFER_SIZE-REF_TABLE_SIZE], 10) > SIGNAL_THRESHOLD;
+}
+
+// Finds index where signal starts in array. Returns 0xFF if signal is not present at the end 
+static inline uint8_t binary_search_find_start_index(const int16_t *src) {
+    // Search over indices 0 to (REDUCED_BUFFER_SIZE - REF_TABLE_SIZE)
+    uint8_t low = 0;
+    uint8_t high = REDUCED_BUFFER_SIZE - REF_TABLE_SIZE;
+    uint8_t startIndex = high;
+    uint8_t steps = 0;
+    
+    uint64_t strength_low = calculate_signal_strength(ref_cos_table_Q15, ref_sine_table_Q15, &src[low], REF_TABLE_SIZE);
+    if (strength_low >= BINARY_SEARCH_THRESHOLD) return 0;
+   
+    uint64_t strength_high = calculate_signal_strength(ref_cos_table_Q15, ref_sine_table_Q15, &src[high], REF_TABLE_SIZE);
+    if (strength_high < BINARY_SEARCH_THRESHOLD) return 0xFF; // Error: the signal in the upper window is below threshold
+   
+    while (low <= high && steps < BINARY_SEARCH_STEPS) {
+        uint8_t mid = low + ((high - low) >> 1);
+        uint64_t strength_mid = calculate_signal_strength(ref_cos_table_Q15, ref_sine_table_Q15, &src[mid], REF_TABLE_SIZE);
+        if (strength_mid >= BINARY_SEARCH_THRESHOLD) {
+            startIndex = mid;
+            if (mid == 0) break; // Found the earliest possible index
+            high = mid - 1;      // Search left
+        } else low = mid + 1;    // Search right
+        steps++;
+    }
+    return startIndex;
+}
+
+
+
 uint16_t align_data[4] __attribute__((aligned(16)));
 uint16_t buffer_ping[BUFFER_SIZE] __attribute__((aligned(16)));
 uint16_t buffer_pong[BUFFER_SIZE] __attribute__((aligned(16)));
@@ -151,29 +194,6 @@ static inline void deinterleave_and_clear_id(const uint16_t *src, size_t num_sam
         *dst4++ = *src++ & 0x0FFF;
     }
 }
-
-static inline void prosess_buffer(uint16_t *src) {
-    swap_buffer_bytes(src,BUFFER_SIZE);
-    deinterleave_and_clear_id(src, BUFFER_SIZE, rec1_arr, rec2_arr,rec3_arr,rec4_arr);
-    rec1_arr[0] = (rec1_arr[0] + rec1_arr[1])/2; // first value is often malformed
-    rec2_arr[0] = (rec2_arr[0] + rec2_arr[1])/2;
-    rec3_arr[0] = (rec3_arr[0] + rec3_arr[1])/2;
-    rec4_arr[0] = (rec4_arr[0] + rec4_arr[1])/2;
-    remove_dc_offset(rec1_arr, REDUCED_BUFFER_SIZE);
-    remove_dc_offset(rec1_arr, REDUCED_BUFFER_SIZE);
-    remove_dc_offset(rec1_arr, REDUCED_BUFFER_SIZE);
-    remove_dc_offset(rec1_arr, REDUCED_BUFFER_SIZE);
-    normalize_signal_arr_Q15(rec1_arr, REDUCED_BUFFER_SIZE);
-    normalize_signal_arr_Q15(rec2_arr, REDUCED_BUFFER_SIZE);
-    normalize_signal_arr_Q15(rec3_arr, REDUCED_BUFFER_SIZE);
-    normalize_signal_arr_Q15(rec4_arr, REDUCED_BUFFER_SIZE);
-    uint32_t temp1,temp2,temp3,temp4;
-    temp1 = calculate_signal_strength(ref_cos_table_Q15, ref_sine_table_Q15, rec1_arr, 10);
-    temp2 = calculate_signal_strength(ref_cos_table_Q15, ref_sine_table_Q15, rec2_arr, 10);
-    temp3 = calculate_signal_strength(ref_cos_table_Q15, ref_sine_table_Q15, rec3_arr, 10);
-    temp4 = calculate_signal_strength(ref_cos_table_Q15, ref_sine_table_Q15, rec4_arr, 10);
-}
-
 
 //
 //  PROGRAM SETUP
@@ -305,9 +325,44 @@ static inline uint32_t get_ccount(void) {
     return ccount;
 }
 
+typedef struct {
+    uint64_t arrival_time_us;
+    bool valid; // flag indicating signal is present. Enables if two succesive buffers are valid
+} receiver_timestamp_t;
+
+receiver_timestamp_t receiver_timestamps[NUM_RECEIVERS];
+
+
+static inline void prosess_buffer(uint16_t *src, uint64_t end_time_us) {
+    swap_buffer_bytes(src,BUFFER_SIZE);
+    deinterleave_and_clear_id(src, BUFFER_SIZE, rec1_arr, rec2_arr,rec3_arr,rec4_arr);
+    rec1_arr[0] = (rec1_arr[0] + rec1_arr[1])/2; // first value is often malformed
+    rec2_arr[0] = (rec2_arr[0] + rec2_arr[1])/2;
+    rec3_arr[0] = (rec3_arr[0] + rec3_arr[1])/2;
+    rec4_arr[0] = (rec4_arr[0] + rec4_arr[1])/2;
+
+    remove_dc_offset(rec1_arr, REDUCED_BUFFER_SIZE);
+    remove_dc_offset(rec2_arr, REDUCED_BUFFER_SIZE);
+    remove_dc_offset(rec3_arr, REDUCED_BUFFER_SIZE);
+    remove_dc_offset(rec4_arr, REDUCED_BUFFER_SIZE);
+
+    if(signalPresent(rec1_arr, REDUCED_BUFFER_SIZE)) {
+        normalize_signal_arr_Q15(rec1_arr, REDUCED_BUFFER_SIZE);
+
+    }
+    if(signalPresent(rec2_arr, REDUCED_BUFFER_SIZE)) {
+        normalize_signal_arr_Q15(rec2_arr, REDUCED_BUFFER_SIZE);
+    }
+    if(signalPresent(rec3_arr, REDUCED_BUFFER_SIZE)) {
+        normalize_signal_arr_Q15(rec3_arr, REDUCED_BUFFER_SIZE);
+    }
+    if(signalPresent(rec4_arr, REDUCED_BUFFER_SIZE)) {
+        normalize_signal_arr_Q15(rec4_arr, REDUCED_BUFFER_SIZE);
+    }
+}
+
+
 QueueHandle_t dmaQueue;
-
-
 
 typedef enum {
     BUFFER_PING = 0,
@@ -348,7 +403,7 @@ void processing_task(void *pvParameters) {
             
             if (event.buf_id == BUFFER_PING) {
                 startCycleCount = get_ccount();
-                prosess_buffer(buffer_ping);
+                prosess_buffer(buffer_ping, event.end_time_us);
                 endCycleCount = get_ccount();
                 misalignedSigCount = (((buffer_ping[0] &0xF000) != 0x0000) ||
                                       ((buffer_ping[1] &0xF000) != 0x1000) ||
@@ -367,7 +422,7 @@ void processing_task(void *pvParameters) {
                 }
             } else {
                 startCycleCount = get_ccount();
-                prosess_buffer(buffer_pong);
+                prosess_buffer(buffer_pong, event.end_time_us);
                 endCycleCount = get_ccount();
                 ESP_ERROR_CHECK(spi_device_queue_trans(spi, &trans_pong, portMAX_DELAY)); 
                 if(printCount % 2000 == 0) {
