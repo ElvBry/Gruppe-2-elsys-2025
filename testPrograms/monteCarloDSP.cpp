@@ -9,13 +9,25 @@
 #include <algorithm>
 #include <limits>
 
-
-// Found nice values for threshold in signal detection before normalization and binary search detection after normalization
-// Before normalization 15000000000 : 15 e9 calculated as 95% chance for true positive when signal amplitude is 10 mv and noise is 5mv
-// After normalization in binary search 650000000000000 : 650 e12
-
-
 using namespace std;
+// found values with noise amplitude 20.0 and signal/burst amplitude 40.0 used as base for signals in real design
+// unnormalized signal threshold 135 has a true positive percentage above 98.78%
+// 0.9878^4 > 0.95 which means the probability of not reading a signal at 40.0 mv amplitude is less than 5%
+// false positive percentage would be above 0.08% which is most likely unnaceptable
+// unnormalized signal threshold 200 has a false positive percentage of < 0.00055% which could be usable
+// the true positive percentage would be above 97.25%
+// 0.9725^4 > 0.8944 which means the probability of not reading a signal at 40.0 mv amplitude is about 10%
+// The latter threshold is probably preferable as the vast majority of buffers will just contain noise
+// and when the signal amplitude is low for one buffer it is most likely higher for others leading to
+// a much higher realized succesfully read signal percentage
+
+
+// normalized threshold value: 600000 
+// -2 samples mean net error 95% of measured difference between -6 and 0 samples
+// mean net error changes with signal amplitude but absolute delta is of 6 is consistent
+// with fine tuned offset we could reach an average accuracy of less than 3 mm
+// calulated with 3 * 2.56(time between samples us) * 0.343 (speed of sound in mm/us)
+
 
 // Simulation constants
 const int SAMPLE_LENGTH = 60;
@@ -25,8 +37,10 @@ const double ADC_REF_VOLTAGE = 3.3;
 const int ADC_MAX_VALUE = 4095;
 const double ADC_STEP = ADC_REF_VOLTAGE / ADC_MAX_VALUE; // ≈0.00080586 V per count
 
-const double NOISE_AMPLITUDE_MV = 5.0;
-const double BURST_AMPLITUDE_MV = 10.0;
+// Set noise and burst amplitudes (in mV), then convert to ADC counts.
+// Adjust these values as needed.
+const double NOISE_AMPLITUDE_MV = 20.0;
+const double BURST_AMPLITUDE_MV = 1000.0;
 const int NOISE_AMPLITUDE_COUNTS = static_cast<int>(round(NOISE_AMPLITUDE_MV / (ADC_STEP * 1000)));
 const int BURST_AMPLITUDE_COUNTS = static_cast<int>(round(BURST_AMPLITUDE_MV / (ADC_STEP * 1000)));
 
@@ -38,6 +52,8 @@ vector<int16_t> ref_cos_table_Q15(REF_TABLE_SIZE);
 void run_simulation_threshold(uint64_t threshold, double signalProb, unsigned int numBuffers);
 void run_simulation_start_estimation(uint64_t threshold, unsigned int numBuffers, double confLevel, int maxSteps);
 
+// Initialize the Q15 sine table.
+// The table is scaled by dividing by the table size to avoid overflow in dot product calculations.
 void initialize_sine_table_Q15() {
     double angleStep = 2 * M_PI / REF_TABLE_SIZE;
     for (int i = 0; i < REF_TABLE_SIZE; i++) {
@@ -46,6 +62,7 @@ void initialize_sine_table_Q15() {
     }
 }
 
+// Initialize the Q15 cosine table.
 void initialize_cos_table_Q15() {
     double angleStep = 2 * M_PI / REF_TABLE_SIZE;
     for (int i = 0; i < REF_TABLE_SIZE; i++) {
@@ -55,12 +72,18 @@ void initialize_cos_table_Q15() {
 }
 
 // Computes signal strength (R² + I²) over a window of REF_TABLE_SIZE samples.
+// This function simulates the DSPS dot product method for Q15 arithmetic.
+// Each multiplication of two Q15 numbers produces a Q30 result, which is then shifted right by 15 bits.
 uint64_t calculate_signal_strength(const vector<int16_t>& window) {
     int32_t R = 0, I = 0;
     for (int i = 0; i < REF_TABLE_SIZE; i++) {
-        R += window[i] * ref_cos_table_Q15[i];
-        I += window[i] * ref_sine_table_Q15[i];
+        // Multiply Q15 numbers (window[i] and ref_cos_table_Q15[i]) => Q30, then accumulate.
+        R += static_cast<int32_t>(window[i]) * ref_cos_table_Q15[i];
+        I += static_cast<int32_t>(window[i]) * ref_sine_table_Q15[i];
     }
+    // To mimic DSPS behavior, shift the accumulated results right by 15 bits.
+    R >>= 15;
+    I >>= 15;
     return static_cast<uint64_t>(R) * R + static_cast<uint64_t>(I) * I;
 }
 
@@ -75,6 +98,7 @@ vector<int16_t> simulate_signal(bool hasBurst, int burstStart) {
         signal[i] = noise_dist(gen);
     }
     if (hasBurst) {
+        // Ensure burst fits in the signal buffer.
         if (burstStart > SAMPLE_LENGTH - 5)
             burstStart = SAMPLE_LENGTH - 5;
         for (int i = burstStart; i < SAMPLE_LENGTH; i++) {
@@ -86,7 +110,9 @@ vector<int16_t> simulate_signal(bool hasBurst, int burstStart) {
     return signal;
 }
 
-// Normalizes the signal in Q15 format.
+// Normalizes the signal into Q15 format.
+// The normalization scales the signal so that its maximum absolute value becomes 32767,
+// and then divides each sample by REF_TABLE_SIZE to match the scaling used in the dot product.
 void normalize_signal(vector<int16_t>& signal) {
     int16_t abs_max = 0;
     for (int16_t val : signal)
@@ -97,15 +123,6 @@ void normalize_signal(vector<int16_t>& signal) {
         signal[i] = static_cast<int16_t>(round(signal[i] * scale));
         signal[i] /= REF_TABLE_SIZE;
     }
-}
-
-// Returns the z-value for common confidence levels.
-// Defaults to 95% if the value is not one of 90, 95, or 99.
-double getZValue(double confLevel) {
-    if (abs(confLevel - 90.0) < 1e-6) return 1.645;
-    if (abs(confLevel - 95.0) < 1e-6) return 1.96;
-    if (abs(confLevel - 99.0) < 1e-6) return 2.576;
-    return 1.96;
 }
 
 // Mode 1: Threshold detection simulation.
@@ -123,6 +140,7 @@ void run_simulation_threshold(uint64_t threshold, double signalProb, unsigned in
         bool isSignal = (probDist(gen) < signalProb);
         int burstStart = burstDist(gen);
         vector<int16_t> signal = simulate_signal(isSignal, burstStart);
+        // Use the last REF_TABLE_SIZE samples as the window.
         vector<int16_t> window(signal.end() - REF_TABLE_SIZE, signal.end());
         uint64_t strength = calculate_signal_strength(window);
         if (isSignal) {
@@ -163,11 +181,8 @@ void run_simulation_threshold(uint64_t threshold, double signalProb, unsigned in
 }
 
 // Mode 2: Start estimation simulation.
-// Only signal buffers are analyzed. For each buffer, after normalization,
-// a binary search (with a maximum number of steps specified by maxSteps)
-// estimates the burst start. The net difference (estimated - actual) is recorded,
-// and then the 2.5th and 97.5th percentiles are computed to show the range
-// that approximately 95% of the measured differences fall between.
+// For each signal buffer, after normalization, a binary search estimates the burst start.
+// The differences (estimated - actual) are collected, and statistics are computed.
 void run_simulation_start_estimation(uint64_t threshold, unsigned int numBuffers, double confLevel, int maxSteps) {
     vector<int> differences;
     random_device rd;
@@ -231,6 +246,7 @@ void run_simulation_start_estimation(uint64_t threshold, unsigned int numBuffers
 }
 
 int main() {
+    // Initialize reference tables in Q15 format.
     initialize_sine_table_Q15();
     initialize_cos_table_Q15();
 
@@ -245,9 +261,9 @@ int main() {
     double signalProb = 0.0;
     if (mode == 1) {
         cout << "\nEnter the noise-to-signal ratio:" << endl;
-        cout << "  • A positive value (e.g., 100) indicates 1 signal for every 100 noise buffers." << endl;
-        cout << "  • A negative value (e.g., -100) indicates 100 signals for every 1 noise buffer." << endl;
-        cout << "  • Enter 0 for all noise." << endl;
+        cout << "A positive value (e.g., 100) indicates 1 signal for every 100 noise buffers." << endl;
+        cout << "A negative value (e.g., -100) indicates 100 signals for every 1 noise buffer." << endl;
+        cout << "Enter 0 for all noise." << endl;
         cout << "Your input: ";
         string ratio_input;
         cin >> ratio_input;
