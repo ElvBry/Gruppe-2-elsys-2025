@@ -16,6 +16,8 @@
 #include "esp_cpu.h"
 #include <inttypes.h>
 
+//TODO: reset frequency in same way that it is started. First check if the all set is valid, then clear them one after another
+
 
 #define PIN_NUM_MISO 19
 #define PIN_NUM_MOSI 23 // not used but full duplex is more synchronised
@@ -28,13 +30,13 @@
 #define SAMPLE_FREQUENCY 390000
 
 #define TARGET_FREQUENCY_1 39000
-#define SIGNAL_THRESHOLD_39kHz 200000
+#define SIGNAL_THRESHOLD_39kHz 2000
 #define NORMALIZED_THRESHOLD_39kHz 400000
 #define BINARY_SEARCH_STEPS_39kHz 20
 #define REF_TABLE_SIZE_39kHz 10
 
 #define MAX_SIGNAL_DIFFERENCE_US 800
-#define MAX_SIGNAL_DURATION_US 30000
+#define MAX_SIGNAL_DURATION_US 15000
 #define SIGNAL_Q15_MAX 8192
 
 #define MAX_CYCLE_COUNT 2*240*REDUCED_BUFFER_SIZE // estimate of CPU_FREQUENCY*REDUCED_BUFFER_SIZE/SAMPLE_FREQYENCY
@@ -225,13 +227,18 @@ void swap_buffer_bytes(uint16_t *buffer, size_t len) {
 
 
 // Splits interlieved buffer into 4 seperate arrays and clears upper 4 bits
-static inline void deinterleave_and_clear_id(const uint16_t *src, size_t num_samples, int16_t *dst1, int16_t *dst2, int16_t *dst3, int16_t *dst4) {
+static inline void deinterleave_and_clear_id(const uint16_t *src, size_t num_samples, int16_t **dst) {
     const uint16_t *end = src + num_samples;
+
+    int16_t *local_dst[NUM_RECEIVERS];
+    for (int i = 0; i < NUM_RECEIVERS; ++i) {
+        local_dst[i] = dst[i]; // Copy original pointers
+    }
+
     while (src < end) {
-        *dst1++ = *src++ & 0x0FFF;  // Clear the upper 4 ID-bits
-        *dst2++ = *src++ & 0x0FFF;
-        *dst3++ = *src++ & 0x0FFF;
-        *dst4++ = *src++ & 0x0FFF;
+        for (int i = 0; i < NUM_RECEIVERS; ++i) {
+            *local_dst[i]++ = *src++ & 0x0FFF;
+        }
     }
 }
 
@@ -317,9 +324,12 @@ static inline bool error_check_cycle(const int64_t maxCycleCount, const uint64_t
 // Searches through buffer to find signal of targeted frequency, if signal is found the arrival time will be logged. If signal was found in previous buffer the receiver will mark the receiver as valid
 static inline void update_frequency_state(int16_t *src, frequency_state_t *freq_state, const uint8_t index, const uint64_t end_time_us, const uint64_t startCycle) {
     if(freq_state->valid_flags[index] == true) {
+
         ESP_LOGD(TAG, "Skip processing receiver: %u: ", index);
         return; // Avoid looking for already found signal
     }
+
+
     // Second measurement of signal
     if(freq_state->arrival_times[index] != 0) {
         if(signalPresent(src, freq_state, freq_state->ref_table_len)) {
@@ -331,6 +341,7 @@ static inline void update_frequency_state(int16_t *src, frequency_state_t *freq_
         } else freq_state->arrival_times[index] = 0;
         return;
     }
+    
    
     //if(src[1] != 0) print_buffer_csv_inline(src, REDUCED_BUFFER_SIZE);
     ESP_LOGD(TAG, "Processing signal");
@@ -362,6 +373,8 @@ static inline void update_frequency_state(int16_t *src, frequency_state_t *freq_
     if(estimated_arrival_time_us > freq_state->last_ping_time_us)
         freq_state->last_ping_time_us = estimated_arrival_time_us;
     freq_state->arrival_times[index] = estimated_arrival_time_us; // First successful measurement of signal
+    //freq_state->valid_flags[index] = true;
+
 }
 
 // Allow frequency to be measured again by setting its updatable values to 0
@@ -391,27 +404,21 @@ void overwrite_receiver_with_ref_cos(int16_t *receiver, const int16_t *ref_cos, 
     }
 }
 
+
+int16_t* receiver_arrays[NUM_RECEIVERS] = {rec1_arr, rec2_arr, rec3_arr, rec4_arr};
+
 static inline void prepare_buffers(uint16_t *src) {
     swap_buffer_bytes(src, BUFFER_SIZE);
-    deinterleave_and_clear_id(src, BUFFER_SIZE, rec1_arr, rec2_arr, rec3_arr, rec4_arr);
-    rec1_arr[0] = rec1_arr[1]; // first value is often malformed
-    rec2_arr[0] = rec2_arr[1];
-    rec3_arr[0] = rec3_arr[1];
-    rec4_arr[0] = rec4_arr[1];
+    deinterleave_and_clear_id(src, BUFFER_SIZE, receiver_arrays);
 
-    remove_dc_offset(rec1_arr, REDUCED_BUFFER_SIZE);
-    remove_dc_offset(rec2_arr, REDUCED_BUFFER_SIZE);
-    remove_dc_offset(rec3_arr, REDUCED_BUFFER_SIZE);
-    remove_dc_offset(rec4_arr, REDUCED_BUFFER_SIZE);
-    /*
-    overwrite_receiver_with_ref_cos(rec1_arr, frequency_states[0].ref_cos, REF_TABLE_SIZE_39kHz, 6);
-    overwrite_receiver_with_ref_cos(rec2_arr, frequency_states[0].ref_cos, REF_TABLE_SIZE_39kHz, 6);
-    overwrite_receiver_with_ref_cos(rec3_arr, frequency_states[0].ref_cos, REF_TABLE_SIZE_39kHz, 6);
-    overwrite_receiver_with_ref_cos(rec4_arr, frequency_states[0].ref_cos, REF_TABLE_SIZE_39kHz, 6);
-    */
+    for (int i = 0; i < NUM_RECEIVERS; ++i) {
+        receiver_arrays[i][0] = receiver_arrays[i][1]; // First value often malformed
+        remove_dc_offset(receiver_arrays[i], REDUCED_BUFFER_SIZE);
+        //overwrite_receiver_with_ref_cos(receiver_arrays[i], frequency_states[0].ref_cos, REF_TABLE_SIZE_39kHz, 6); debug
+        
+    }
     //ESP_LOGI(TAG, "Finished overwrite");
 }
-
 
 static inline void process_receivers(uint64_t end_time_us, const uint64_t startCycle) {
     uint64_t start_time_us = calculate_arrival_time_us(end_time_us, 0, REDUCED_BUFFER_SIZE);
@@ -420,7 +427,7 @@ static inline void process_receivers(uint64_t end_time_us, const uint64_t startC
             ESP_LOGD(TAG, "ALL FOUND: %lld", end_time_us);
             if((start_time_us > frequency_states[i].cooldown_until_us)) {
                 reset_frequency_state(&frequency_states[i]);  // Avoid searching for frequency if it has been found. After a duration it can be measured again
-                ESP_LOGI(TAG, "reset frequency max_duration");
+                ESP_LOGD(TAG, "reset frequency max_duration");
             }
             continue;
         }
@@ -448,28 +455,22 @@ static inline void process_receivers(uint64_t end_time_us, const uint64_t startC
             return;
         }
 
-
-
         if(error_check_cycle(MAX_CYCLE_COUNT, startCycle, 100)) break;
         ESP_LOGD(TAG, "Before update");
-        update_frequency_state(rec1_arr, &frequency_states[i], 0, end_time_us, startCycle);
-        if(error_check_cycle(MAX_CYCLE_COUNT, startCycle, 0)) break;
-        ESP_LOGD(TAG, "finished update 1");
-        update_frequency_state(rec2_arr, &frequency_states[i], 1, end_time_us, startCycle);
-        if(error_check_cycle(MAX_CYCLE_COUNT, startCycle, 1)) break;
-        ESP_LOGD(TAG, "finished update 2");
-        update_frequency_state(rec3_arr, &frequency_states[i], 2, end_time_us, startCycle);
-        if(error_check_cycle(MAX_CYCLE_COUNT, startCycle, 2)) break;
-        ESP_LOGD(TAG, "finished update 3");
-        update_frequency_state(rec4_arr, &frequency_states[i], 3, end_time_us, startCycle);
-        if(error_check_cycle(MAX_CYCLE_COUNT, startCycle, 3)) break;
-        ESP_LOGD(TAG, "finished update 4");
+
+
+        
+        for(int j = 0; j < NUM_RECEIVERS; j++) {
+            update_frequency_state(receiver_arrays[j], &frequency_states[i], j, end_time_us, startCycle);
+            if(error_check_cycle(MAX_CYCLE_COUNT, startCycle, j)) break;
+            ESP_LOGD(TAG, "finished update %d", j + 1);
+        }
+        
         if(frequency_states[i].all_valid == true)  print_receiver_values_csv(&frequency_states[i]);
     }
-    rec1_arr[REDUCED_BUFFER_SIZE] = 0;
-    rec2_arr[REDUCED_BUFFER_SIZE] = 0;
-    rec3_arr[REDUCED_BUFFER_SIZE] = 0;
-    rec4_arr[REDUCED_BUFFER_SIZE] = 0;
+    for(int j = 0; j < NUM_RECEIVERS; j++) {
+        receiver_arrays[j][REDUCED_BUFFER_SIZE] = 0;
+    }
 }
 
 
@@ -538,7 +539,7 @@ void processing_task(void *pvParameters) {
                 */
                 //print_buffer_csv_inline(rec1_arr, REDUCED_BUFFER_SIZE);
             } else {
-                prepare_buffers(buffer_ping);
+                prepare_buffers(buffer_pong);
                 startCycleCount = get_ccount();
                 process_receivers(event.end_time_us,startCycleCount);
                 endCycleCount = get_ccount();
