@@ -10,27 +10,21 @@
 #include <limits>
 
 using namespace std;
-// found values with noise amplitude 20.0 and signal/burst amplitude 40.0 used as base for signals in real design
-// unnormalized signal threshold 135 has a true positive percentage above 98.78%
-// 0.9878^4 > 0.95 which means the probability of not reading a signal at 40.0 mv amplitude is less than 5%
-// false positive percentage would be above 0.08% which is most likely unnaceptable
-// unnormalized signal threshold 200 has a false positive percentage of < 0.00055% which could be usable
-// the true positive percentage would be above 97.25%
-// 0.9725^4 > 0.8944 which means the probability of not reading a signal at 40.0 mv amplitude is about 10%
-// The latter threshold is probably preferable as the vast majority of buffers will just contain noise
-// and when the signal amplitude is low for one buffer it is most likely higher for others leading to
-// a much higher realized succesfully read signal percentage
+// found values with noise amplitude 80.0 and signal/burst amplitude 130mV used as base for signals in real design
+// unnormalized signal threshold 2300 has a true positive percentage above 99.36%
+// 0.9936^8 = 0.95 which means the probability of not reading a signal at 130.0 mv amplitude with 80mV noise is less than 5%
+// false positive percentage was below 0.0167%, which means the probability of a false reading is about 1 per 3600 readings.
+// 0.0167^2 * 3600 = 1.00
 
-
-// normalized threshold value: 600000 
-// -2 samples mean net error 95% of measured difference between -6 and 0 samples
-// mean net error changes with signal amplitude but absolute delta is of 6 is consistent
-// with fine tuned offset we could reach an average accuracy of less than 3 mm
-// calulated with 3 * 2.56(time between samples us) * 0.343 (speed of sound in mm/us)
+// normalized threshold value: 400000 
+// -1 samples mean net error 95% of measured difference between -6 and 2 samples with 8 steps
+// mean net error changes with signal amplitude but absolute delta around 8 is consistent
+// This corresponds to an accuracy above 7mm 95% of the time
+// calulated with 8 * 2.56(time between samples us) * 0.343 (speed of sound in mm/us)
 
 
 // Simulation constants
-const int SAMPLE_LENGTH = 60;
+const int SAMPLE_LENGTH = 900;
 const int REF_TABLE_SIZE = 10;
 
 const double ADC_REF_VOLTAGE = 3.3;
@@ -39,8 +33,8 @@ const double ADC_STEP = ADC_REF_VOLTAGE / ADC_MAX_VALUE; // ≈0.00080586 V per 
 
 // Set noise and burst amplitudes (in mV), then convert to ADC counts.
 // Adjust these values as needed.
-const double NOISE_AMPLITUDE_MV = 20.0;
-const double BURST_AMPLITUDE_MV = 1000.0;
+const double NOISE_AMPLITUDE_MV = 80.0;
+const double BURST_AMPLITUDE_MV = 130.0;
 const int NOISE_AMPLITUDE_COUNTS = static_cast<int>(round(NOISE_AMPLITUDE_MV / (ADC_STEP * 1000)));
 const int BURST_AMPLITUDE_COUNTS = static_cast<int>(round(BURST_AMPLITUDE_MV / (ADC_STEP * 1000)));
 
@@ -89,6 +83,7 @@ uint64_t calculate_signal_strength(const vector<int16_t>& window) {
 
 // Generates a simulated buffer of SAMPLE_LENGTH samples with noise.
 // If hasBurst is true, a sine burst is added starting at burstStart.
+
 vector<int16_t> simulate_signal(bool hasBurst, int burstStart) {
     vector<int16_t> signal(SAMPLE_LENGTH, 0);
     static random_device rd;
