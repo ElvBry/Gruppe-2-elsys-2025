@@ -9,6 +9,7 @@
 #include "driver/spi_master.h"
 #include "driver/ledc.h"
 #include "driver/gpio.h"
+#define LOG_LOCAL_LEVEL ESP_LOG_INFO
 #include "esp_log.h"
 #include "dsps_dotprod.h"
 #include "esp_timer.h"
@@ -16,8 +17,9 @@
 #include "esp_cpu.h"
 #include <inttypes.h>
 
-//TODO: reset frequency in same way that it is started. First check if the all set is valid, then clear them one after another
 
+// Program that reads ADC data from an FPGA and calculates the time difference between starting points of a target sine frequency
+// Log level is set to INFO meaning only LOGE/LOGW/LOGI will be output through serial in order to avoid overcrowding and triggering of the watchdog
 
 #define PIN_NUM_MISO 19
 #define PIN_NUM_MOSI 23 // not used but full duplex is more synchronised
@@ -30,9 +32,9 @@
 #define SAMPLE_FREQUENCY 390000
 
 #define TARGET_FREQUENCY_1 39000
-#define SIGNAL_THRESHOLD_39kHz 2000
-#define NORMALIZED_THRESHOLD_39kHz 400000
-#define BINARY_SEARCH_STEPS_39kHz 20
+#define SIGNAL_THRESHOLD_39kHz 600000
+#define NORMALIZED_THRESHOLD_39kHz 600000
+#define BINARY_SEARCH_STEPS_39kHz 15
 #define REF_TABLE_SIZE_39kHz 10
 
 #define MAX_SIGNAL_DIFFERENCE_US 800
@@ -43,6 +45,8 @@
 
 #define NUM_FREQUENCIES 1
 #define NUM_RECEIVERS 4
+
+
 
 static const char *TAG = "TDOA_DSP";
 
@@ -108,8 +112,8 @@ static inline uint64_t calculate_arrival_time_us(uint64_t end_time_us, const uin
 
 
 static inline void remove_dc_offset(int16_t* buffer, const uint16_t len) {
-    int32_t sum = 0;
-    for (int i = 0; i < 10; i++) sum += buffer[i];
+    int64_t sum = 0;
+    for (int i = 0; i < len; i++) sum += buffer[i];
 
     int16_t offset = (int16_t)(sum / len);
 
@@ -158,7 +162,7 @@ static inline void normalize_signal_arr_Q15(int16_t *signal_arr, const uint16_t 
     }
 }
 
-static inline bool signalPresent(const int16_t *src, const frequency_state_t *freq_state, const uint16_t len) { 
+static inline bool signal_present(const int16_t *src, const frequency_state_t *freq_state, const uint16_t len) { 
 
     uint64_t strength = calculate_signal_strength(
         freq_state->ref_cos, 
@@ -310,7 +314,7 @@ static inline uint32_t get_ccount(void) {
     return ccount;
 }
 
-
+// Returns true if the processing has used more than its maximum allowable cycles
 static inline bool error_check_cycle(const int64_t maxCycleCount, const uint64_t startCycle, const uint8_t index) {
     int64_t currentCycle = get_ccount();
     if(startCycle + maxCycleCount < currentCycle) {
@@ -321,18 +325,19 @@ static inline bool error_check_cycle(const int64_t maxCycleCount, const uint64_t
 }
 
 
-// Searches through buffer to find signal of targeted frequency, if signal is found the arrival time will be logged. If signal was found in previous buffer the receiver will mark the receiver as valid
-static inline void update_frequency_state(int16_t *src, frequency_state_t *freq_state, const uint8_t index, const uint64_t end_time_us, const uint64_t startCycle) {
-    if(freq_state->valid_flags[index] == true) {
 
+
+// Searches through buffer to find signal of targeted frequency, if signal is found the arrival time will be logged.
+// If signal was found in previous buffer the receiver will mark the signal as valid. If the flag was the last one the all_valid flag will be set to true
+static inline void find_signal_present(int16_t *src, frequency_state_t *freq_state, const uint8_t index, const uint64_t end_time_us, const uint64_t startCycle) {
+    if(freq_state->valid_flags[index] == true) {
         ESP_LOGD(TAG, "Skip processing receiver: %u: ", index);
         return; // Avoid looking for already found signal
     }
-
-
+    
     // Second measurement of signal
     if(freq_state->arrival_times[index] != 0) {
-        if(signalPresent(src, freq_state, freq_state->ref_table_len)) {
+        if(signal_present(src, freq_state, freq_state->ref_table_len)) {
             freq_state->valid_flags[index] = true;
             for (int i = 0; i < NUM_RECEIVERS; i++) {
                 if(!freq_state->valid_flags[i]) break;
@@ -342,22 +347,23 @@ static inline void update_frequency_state(int16_t *src, frequency_state_t *freq_
         return;
     }
     
+    
    
     //if(src[1] != 0) print_buffer_csv_inline(src, REDUCED_BUFFER_SIZE);
     ESP_LOGD(TAG, "Processing signal");
-    if(!signalPresent(src, freq_state, REDUCED_BUFFER_SIZE)) {
+    if(!signal_present(src, freq_state, REDUCED_BUFFER_SIZE)) {
         ESP_LOGD(TAG, "Signal processing failed");
         return; // Initial check for signal in order to avoid normalizing noise which breaks binary search
     }
     //print_buffer_csv_inline(src, REDUCED_BUFFER_SIZE);
     if(src[REDUCED_BUFFER_SIZE] == false) {
         normalize_signal_arr_Q15(src, REDUCED_BUFFER_SIZE, freq_state->ref_table_len);
-        src[REDUCED_BUFFER_SIZE] = (int16_t)true;
+        src[REDUCED_BUFFER_SIZE] = (int16_t)true; // avoid normalizing multiple times if we analyze multiple frequencies
     }
     uint16_t estimated_start_index = binary_search_find_start_index(src, freq_state);
     if(estimated_start_index == 0xFF) {
         //print_buffer_csv_inline(src+REDUCED_BUFFER_SIZE/4, REDUCED_BUFFER_SIZE/4);
-        //ESP_LOGE(TAG, "could not find signal after normalization");
+        ESP_LOGD(TAG, "could not find signal after normalization");
         return;
     }
     
@@ -373,8 +379,38 @@ static inline void update_frequency_state(int16_t *src, frequency_state_t *freq_
     if(estimated_arrival_time_us > freq_state->last_ping_time_us)
         freq_state->last_ping_time_us = estimated_arrival_time_us;
     freq_state->arrival_times[index] = estimated_arrival_time_us; // First successful measurement of signal
-    //freq_state->valid_flags[index] = true;
+}
 
+// Opposite of find_signal_present checks if the signal has dissapeared in two buffers in a row
+// First signal not detected leads to removed valid flag, second to removed arrival time. When all are gone valid_flags is removed
+// If a signal is detected both arrival time and valid flag are reset
+static inline void check_signal_gone(int16_t *src, frequency_state_t *freq_state, uint8_t index, uint64_t end_time_us) {
+    
+    if (signal_present(src, freq_state, REDUCED_BUFFER_SIZE)) {  // If signal is present at end of buffer Signal present, return
+        freq_state->valid_flags[index] = true;
+        freq_state->arrival_times[index] = end_time_us; // reset timer
+        return;
+    }
+
+    if (freq_state->valid_flags[index]) { // First removal
+        freq_state->valid_flags[index] = 0;
+        return;
+    }
+    
+    freq_state->arrival_times[index] = 0; // Second removal
+
+    // If all receivers have lost the signal, reset the overall valid flag.
+    bool allZero = true;
+    for (int i = 0; i < NUM_RECEIVERS; i++) {
+        if (freq_state->arrival_times[i] != 0) {
+            allZero = false;
+            break;
+        }
+    }
+    if (allZero) {
+        freq_state->last_ping_time_us = 0;
+        freq_state->all_valid = 0;
+    }
 }
 
 // Allow frequency to be measured again by setting its updatable values to 0
@@ -424,19 +460,31 @@ static inline void process_receivers(uint64_t end_time_us, const uint64_t startC
     uint64_t start_time_us = calculate_arrival_time_us(end_time_us, 0, REDUCED_BUFFER_SIZE);
     for (int i = 0; i < NUM_FREQUENCIES; i++) {
         if(frequency_states[i].all_valid) {
+            
+            for(int j = 0; j < NUM_RECEIVERS; j++) {
+                check_signal_gone(receiver_arrays[j], &frequency_states[i], j, end_time_us);
+            }
+            
+            // Old approach:
+            /*
             ESP_LOGD(TAG, "ALL FOUND: %lld", end_time_us);
             if((start_time_us > frequency_states[i].cooldown_until_us)) {
                 reset_frequency_state(&frequency_states[i]);  // Avoid searching for frequency if it has been found. After a duration it can be measured again
                 ESP_LOGD(TAG, "reset frequency max_duration");
             }
+            */
+            
             continue;
         }
+
         // Targeted frequency is reset if not enough receivers noticed it within a realistic timeframe
         if((frequency_states[i].last_ping_time_us > 0) && (start_time_us > frequency_states[i].last_ping_time_us + MAX_SIGNAL_DIFFERENCE_US)) {
             reset_frequency_state(&frequency_states[i]);
             ESP_LOGD(TAG, "reset frequency max_difference");
             continue;
         }
+
+        // If the arrival time for two receivers are the same a problem has almost certainly occured and we should ignore the reading
         bool any_equal = false;
         for (int a = 0; a < NUM_RECEIVERS; a++) {
             for (int b = a + 1; b < NUM_RECEIVERS; b++) {
@@ -450,18 +498,16 @@ static inline void process_receivers(uint64_t end_time_us, const uint64_t startC
         }
 
         if (any_equal) {
-            ESP_LOGW(TAG, "Duplicate arrival times detected, resetting.");
+            ESP_LOGD(TAG, "Duplicate arrival times detected, resetting.");
             reset_frequency_state(&frequency_states[i]);
-            return;
+            continue;
         }
 
         if(error_check_cycle(MAX_CYCLE_COUNT, startCycle, 100)) break;
         ESP_LOGD(TAG, "Before update");
 
-
-        
         for(int j = 0; j < NUM_RECEIVERS; j++) {
-            update_frequency_state(receiver_arrays[j], &frequency_states[i], j, end_time_us, startCycle);
+            find_signal_present(receiver_arrays[j], &frequency_states[i], j, end_time_us, startCycle);
             if(error_check_cycle(MAX_CYCLE_COUNT, startCycle, j)) break;
             ESP_LOGD(TAG, "finished update %d", j + 1);
         }
@@ -500,7 +546,8 @@ void acquisition_task(void *pvParameters) {
         ESP_ERROR_CHECK(spi_device_get_trans_result(spi, &rtrans, portMAX_DELAY)); // Waits until dma is finished
         event.buf_id = (buffer_id_t) rtrans->user;
         event.end_time_us = esp_timer_get_time();
-        xQueueSend(dmaQueue, &event, portMAX_DELAY); // Notify the processing task that this buffer is ready.
+        ESP_ERROR_CHECK(spi_device_queue_trans(spi, rtrans, portMAX_DELAY)); // requeue the transaction
+        xQueueSend(dmaQueue, &event, portMAX_DELAY); // Notify the processing task that this buffer is ready.   
     }
 }
 
@@ -525,7 +572,7 @@ void processing_task(void *pvParameters) {
                 process_receivers(event.end_time_us,startCycleCount);
                 endCycleCount = get_ccount();
                 ESP_LOGD(TAG, "TIME: %lld, CYCLES: %lld", event.end_time_us, endCycleCount-startCycleCount);
-                ESP_ERROR_CHECK(spi_device_queue_trans(spi, &trans_ping, portMAX_DELAY)); // requeue the ping transaction
+                
 
                 if(printCount % 2000 == 0) {
                     ESP_LOGD(TAG, "Ping Buffer first 8 samples: HEX: %04X %04X %04X %04X %04X %04X %04X %04X, CYCLES: %lld, DEC: %d %d %d %d %d %d %d %d", 
@@ -533,17 +580,17 @@ void processing_task(void *pvParameters) {
                         buffer_ping[0]&0x0FFF, buffer_ping[1]&0x0FFF, buffer_ping[2]&0x0FFF, buffer_ping[3]&0x0FFF, buffer_ping[4]&0x0FFF, buffer_ping[5]&0x0FFF, buffer_ping[6]&0x0FFF, buffer_ping[7]&0x0FFF);   
                 } 
                 /*
-                if(printCount % 20000 == 0) {
+                if(printCount % 2000000 == 0) {
                     print_buffer_csv_inline(rec1_arr, REDUCED_BUFFER_SIZE);
                 }
                 */
+                
                 //print_buffer_csv_inline(rec1_arr, REDUCED_BUFFER_SIZE);
             } else {
                 prepare_buffers(buffer_pong);
                 startCycleCount = get_ccount();
                 process_receivers(event.end_time_us,startCycleCount);
                 endCycleCount = get_ccount();
-                ESP_ERROR_CHECK(spi_device_queue_trans(spi, &trans_pong, portMAX_DELAY)); 
                 if(printCount % 2000 == 0) {
                     ESP_LOGD(TAG, "Pong Buffer first 8 samples: HEX: %04X %04X %04X %04X %04X %04X %04X %04X, CYCLES: %lld, DEC: %d %d %d %d %d %d %d %d", 
                         buffer_pong[0], buffer_pong[1], buffer_pong[2], buffer_pong[3], buffer_pong[4], buffer_pong[5], buffer_pong[6], buffer_pong[7], endCycleCount-startCycleCount,
@@ -600,7 +647,7 @@ void app_main(void) {
         .sclk_io_num = PIN_NUM_CLK,
         .quadwp_io_num = -1,
         .quadhd_io_num = -1,
-        .max_transfer_sz =  BUFFER_SIZE * sizeof(uint16_t), // amount of bytes in each buffer, should not exceed 4092
+        .max_transfer_sz =  BUFFER_SIZE * sizeof(uint16_t), // amount of bytes in each buffer
         .flags = 0,
         .intr_flags = 0,
     };
